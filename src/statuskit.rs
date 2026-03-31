@@ -16,7 +16,7 @@ use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 use rand::{rngs::OsRng, RngCore};
 
-use crate::{APSConnection, APSMessage, IdentityManager, OSConfig, PushError, TokenProvider, aps::{APSChannel, APSChannelIdentifier, APSInterestToken, get_message}, ids::{IDSRecvMessage, identity_manager::{IDSSendMessage, Raw}, user::QueryOptions}, util::{DebugMutex, DebugRwLock, base64_decode, base64_encode, decode_hex, encode_hex, plist_to_bin}};
+use crate::{APSConnection, APSMessage, IdentityManager, OSConfig, PushError, TokenProvider, aps::{APSChannel, APSChannelIdentifier, APSInterestToken, get_message}, ids::{IDSRecvMessage, identity_manager::{IDSSendMessage, Raw}, user::QueryOptions}, util::{DebugMutex, DebugRwLock, base64_decode, base64_encode, decode_hex, encode_hex, gzip, plist_to_bin}};
 use crate::util::{CompactECKey, ec_serialize, ec_serialize_priv, bin_serialize, bin_deserialize, proto_serialize, proto_deserialize, ec_deserialize_priv_compact, ec_deserialize_compact, proto_serialize_vec, proto_deserialize_vec};
 use aes_gcm::KeyInit;
 
@@ -801,6 +801,80 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
             }
         }
         Ok(None)
+    }
+
+    pub async fn send_personal_status(&self, active: bool) -> Result<(), PushError> {
+        let apple_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs_f64() - 978307200.0;
+
+        let state = if active {
+            PrivateStatusState {
+                active: vec![ActiveState {
+                    tag: StateTag {
+                        bundle: "com.apple.focus.activity-manager".to_string(),
+                        id: None,
+                    },
+                    activation_time: apple_time,
+                    uuid: Uuid::new_v4().to_string().to_uppercase(),
+                    state: State {
+                        owner: "com.apple.focus.activity-manager".to_string(),
+                        r#type: "com.apple.donotdisturb.mode.default".to_string(),
+                        activation_config: Some(StateActivationMode::Schedule {
+                            unk2: "com.apple.donotdisturb.schedule.default".to_string(),
+                            unk3: "expire-on-end".to_string(),
+                        }),
+                        activate_reason: "user-action".to_string(),
+                        activation_time: Some(apple_time),
+                    },
+                }],
+                passive: vec![],
+                third: vec![],
+            }
+        } else {
+            PrivateStatusState {
+                active: vec![],
+                passive: vec![],
+                third: vec![],
+            }
+        };
+
+        let message = PrivateStatusMessage {
+            meta: PrivateStatusMeta {
+                version: 1,
+                time: apple_time,
+                unk: 11,
+            },
+            update: PrivateStatusUpdate {
+                id: Uuid::new_v4().to_string().to_uppercase(),
+                time: apple_time,
+                state,
+            },
+        };
+
+        let plist_bytes = plist_to_bin(&message)?;
+        let compressed = gzip(&plist_bytes)?;
+
+        let handles = self.identity.get_handles().await;
+        let sender = handles.first().ok_or(PushError::NoHandle)?.clone();
+
+        let ids_message = IDSSendMessage {
+            sender: sender.clone(),
+            raw: Raw::Body(compressed),
+            send_delivered: false,
+            command: 227,
+            no_response: true,
+            id: Uuid::new_v4().to_string().to_uppercase(),
+            scheduled_ms: None,
+            queue_id: None,
+            relay: None,
+            extras: Default::default(),
+        };
+
+        self.identity.cache_keys("com.apple.private.alloy.status.personal", &handles, &sender, false, &QueryOptions { required_for_message: false, result_expected: false }).await?;
+        let targets = self.identity.cache.lock().await.get_participants_targets("com.apple.private.alloy.status.personal", &sender, &handles);
+
+        self.identity.send_message("com.apple.private.alloy.status.personal", ids_message, targets).await?;
+
+        Ok(())
     }
 }
 
