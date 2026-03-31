@@ -313,6 +313,9 @@ pub enum StatusKitMessage {
         user: String,
         mode: Option<String>,
         allowed: bool,
+    },
+    FocusSyncChanged {
+        active_modes: Vec<String>,
     }
 }
 
@@ -785,9 +788,14 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
                     (self.update_state)(&state);
                 },
                 "com.apple.private.alloy.status.personal" => {
-                    // let values: PrivateStatusMessage = message.plist()?;
-                    // debug!("Got status personal message {:#?}", values);
-                    // not used atm
+                    let values: PrivateStatusMessage = message.plist()?;
+                    debug!("Got status personal message {:#?}", values);
+                    let active_modes: Vec<String> = values.update.state.active.iter()
+                        .filter_map(|a| Some(a.tag.bundle.clone()))
+                        .collect();
+                    return Ok(Some(StatusKitMessage::FocusSyncChanged {
+                        active_modes,
+                    }));
                 },
                 _ => {}
             }
