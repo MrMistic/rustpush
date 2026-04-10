@@ -12,6 +12,7 @@ pub mod facetime;
 pub mod icloud;
 pub mod statuskit;
 pub mod passwords;
+pub mod notes;
 pub use imessage::cloud_messages;
 pub use imessage::posterkit;
 pub use util::KeyedArchive;

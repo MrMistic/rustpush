@@ -1,0 +1,60 @@
+syntax = "proto2";
+package notestore;
+
+message NoteStoreProto {
+  optional Document document = 2;
+}
+
+message Document {
+  optional Note note = 1;
+  optional uint32 version = 2;
+}
+
+message Note {
+  optional string noteText = 2;
+  repeated AttributeRun attributeRun = 5;
+}
+
+message AttributeRun {
+  optional uint32 length = 1;
+  optional ParagraphStyle paragraphStyle = 2;
+  optional Font font = 3;
+  optional int32 fontWeight = 5;
+  optional bool underlined = 6;
+  optional bool strikethrough = 7;
+  optional int32 superscript = 8;
+  optional string link = 9;
+  optional Color color = 10;
+  optional AttachmentInfo attachmentInfo = 12;
+}
+
+message ParagraphStyle {
+  optional int32 style = 1;
+  optional int32 alignment = 2;
+  optional int32 indent = 4;
+  optional Checklist checklist = 6;
+  optional int32 blockQuote = 9;
+}
+
+message Checklist {
+  optional bytes uuid = 1;
+  optional int32 done = 2;
+}
+
+message Font {
+  optional string fontName = 1;
+  optional float pointSize = 2;
+  optional int32 fontHints = 3;
+}
+
+message Color {
+  optional float red = 1;
+  optional float green = 2;
+  optional float blue = 3;
+  optional float alpha = 4;
+}
+
+message AttachmentInfo {
+  optional string attachmentIdentifier = 1;
+  optional string typeUTI = 2;
+}
