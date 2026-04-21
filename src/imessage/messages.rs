@@ -25,6 +25,10 @@ include!("./rawmessages.rs");
 const ZERO_NONCE: [u8; 16] = [
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
 ];
+
+/// Apple's user-generated Stickers Messages extension bundle id.
+pub const STICKERS_EXT_BID: &str =
+    "com.apple.messages.MSMessageExtensionBalloonPlugin:0000000000:com.apple.Stickers.UserGenerated.MessagesExtension";
 // conversation data, used to uniquely identify a conversation from a message
 #[repr(C)]
 #[derive(Clone)]
@@ -214,6 +218,7 @@ impl MessageParts {
                 MessagePart::Attachment(attachment) => {
                     my_part_idx += 1;
                     let filesize = attachment.get_size().to_string();
+                    let is_sticker = matches!(&part.ext, Some(PartExtension::Sticker { .. }));
                     let mut element = XmlEvent::start_element("FILE")
                         .attr("name", &attachment.name)
                         .attr("width", "0")
@@ -221,8 +226,12 @@ impl MessageParts {
                         .attr("datasize", &filesize)
                         .attr("mime-type", &attachment.mime)
                         .attr("uti-type", &attachment.uti_type)
-                        .attr("file-size", &filesize)
-                        .attr("message-part", &part_idx);
+                        .attr("file-size", &filesize);
+                    // iPad sticker FILE elements omit `message-part`; including
+                    // it caused iPad to treat stickers as "Attached".
+                    if !is_sticker {
+                        element = element.attr("message-part", &part_idx);
+                    }
                     let ext = part.ext.as_ref().map(|e| e.to_dict()).unwrap_or_else( || HashMap::new());
                     for (key, val) in &ext {
                         element = element.attr(key.as_str(), val);
@@ -643,7 +652,36 @@ impl ExtensionApp {
             }],
             class: NSArrayClass::NSMutableArray,
         };
-        let collapse = gzip(&plist_to_bin(&KeyedArchive::archive_item(plist::to_value(&arr)?)?)?)?;
+        let mut val = plist::to_value(&arr)?;
+
+        // For the Stickers extension, inject preview generation metadata
+        // that iPad includes in the ati plist (pgensh, pgensw, pgenszc).
+        // Without these, iPad may not render the sticker as a positioned
+        // overlay. Values are constant for all user-generated emoji stickers.
+        if self.bundle_id == STICKERS_EXT_BID {
+            if let Some(objects) = val.as_dictionary_mut()
+                .and_then(|d| d.get_mut("NS.objects"))
+                .and_then(|v| v.as_array_mut())
+            {
+                if let Some(Value::Dictionary(ref mut app_dict)) = objects.first_mut() {
+                    app_dict.insert("pgensh".to_string(), Value::Real(320.0));
+                    app_dict.insert("pgensw".to_string(), Value::Real(320.0));
+
+                    let mut pgenszc = plist::Dictionary::new();
+                    pgenszc.insert("mpw".to_string(), Value::String("600.000000".to_string()));
+                    pgenszc.insert("gm".to_string(), Value::Boolean(false));
+                    pgenszc.insert("mth".to_string(), Value::String("100.000000".to_string()));
+                    pgenszc.insert("mtw".to_string(), Value::String("100.000000".to_string()));
+                    pgenszc.insert("iaig".to_string(), Value::Boolean(false));
+                    pgenszc.insert("st".to_string(), Value::Boolean(false));
+                    pgenszc.insert("s".to_string(), Value::String("2.000000".to_string()));
+                    pgenszc.insert("$class".to_string(), Value::String("NSMutableDictionary".to_string()));
+                    app_dict.insert("pgenszc".to_string(), Value::Dictionary(pgenszc));
+                }
+            }
+        }
+
+        let collapse = gzip(&plist_to_bin(&KeyedArchive::archive_item(val)?)?)?;
         let mut balloon = None;
         if let Some(balloon_obj) = &self.balloon {
             balloon = Some(balloon_obj.to_raw(self)?);
@@ -872,16 +910,33 @@ pub enum PartExtension {
 
 impl PartExtension {
     fn to_dict(&self) -> HashMap<String, String> {
-        plist::to_value(self).unwrap().into_dictionary().unwrap().into_iter()
+        let mut result: HashMap<String, String> = plist::to_value(self).unwrap().into_dictionary().unwrap().into_iter()
             .map(|(i, value)| {
                 (i, match value {
                     Value::Boolean(v) => v.to_string(),
-                    Value::Real(r) => r.to_string(),
+                    // iPad formats sticker floats with 8 decimal places
+                    Value::Real(r) => format!("{:.8}", r),
                     Value::Integer(i) => i.to_string(),
                     Value::String(s) => s,
                     _ => panic!("unsupported in html value!")
                 })
-            }).collect()
+            }).collect();
+        match self {
+            PartExtension::Sticker { hash, .. } => {
+                result.insert("pid".to_string(), STICKERS_EXT_BID.to_string());
+
+                // `suri`: iPad emits `suri="sticker:///emoji/identifier/<emoji>"`
+                // on the FILE element. The emoji is side-channeled through
+                // the hash field as "hash|emoji" from Dart (avoids needing
+                // an frb bridge change). Split it here, replacing the dirty
+                // hash with the clean one and emitting suri.
+                if let Some((clean_hash, emoji)) = hash.split_once('|') {
+                    result.insert("shash".to_string(), clean_hash.to_string());
+                    result.insert("suri".to_string(), format!("sticker:///emoji/identifier/{}", emoji));
+                }
+            }
+        }
+        result
     }
 
     fn from_dict(mut data: HashMap<String, String>) -> Option<Self> {
