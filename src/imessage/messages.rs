@@ -233,6 +233,11 @@ impl MessageParts {
                         element = element.attr("message-part", &part_idx);
                     }
                     let ext = part.ext.as_ref().map(|e| e.to_dict()).unwrap_or_else( || HashMap::new());
+                    if is_sticker {
+                        info!("STICKER OUT: FILE attrs name={} size={} mime={} uti={}",
+                            attachment.name, filesize, attachment.mime, attachment.uti_type);
+                        info!("STICKER OUT: FILE ext-dict = {:?}", ext);
+                    }
                     for (key, val) in &ext {
                         element = element.attr(key.as_str(), val);
                     }
@@ -653,6 +658,10 @@ impl ExtensionApp {
             class: NSArrayClass::NSMutableArray,
         };
         let mut val = plist::to_value(&arr)?;
+
+        if self.bundle_id == STICKERS_EXT_BID {
+            info!("STICKER OUT: ati plist (pre-inject) = {:?}", plist_to_string(&val));
+        }
 
         // For the Stickers extension, inject preview generation metadata
         // that iPad includes in the ati plist (pgensh, pgensw, pgenszc).
@@ -2342,6 +2351,16 @@ impl MessageInst {
         
                         if normal.parts.is_multipart() {
                             raw.xml = Some(normal.parts.to_xml(Some(&mut raw)));
+                        }
+                        // Log outgoing XML when a sticker is present to aid wire-format RE.
+                        let has_sticker = normal.parts.0.iter().any(|p| matches!(p.ext, Some(PartExtension::Sticker { .. })));
+                        if has_sticker {
+                            if let Some(xml) = &raw.xml {
+                                info!("STICKER OUT: final XML = {}", xml);
+                            }
+                            info!("STICKER OUT: raw.bid = {:?}", raw.bid);
+                            info!("STICKER OUT: raw.ati len = {:?}", raw.ati.as_ref().map(|a| a.len()));
+                            info!("STICKER OUT: raw.balloon_part present = {:?}", raw.balloon_part.is_some());
                         }
                         
                         should_gzip = !raw.xml.is_some();
