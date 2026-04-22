@@ -2358,8 +2358,11 @@ impl MessageInst {
                             if let Some(xml) = &raw.xml {
                                 info!("STICKER OUT: final XML = {}", xml);
                             }
-                            info!("STICKER OUT: raw.bid = {:?}", raw.bid);
-                            info!("STICKER OUT: raw.ati len = {:?}", raw.ati.as_ref().map(|a| a.len()));
+                            info!("STICKER OUT: raw.balloon_id = {:?}", raw.balloon_id);
+                            info!("STICKER OUT: raw.app_info len = {:?}", raw.app_info.as_ref().map(|a| {
+                                let d: &[u8] = a.as_ref();
+                                d.len()
+                            }));
                             info!("STICKER OUT: raw.balloon_part present = {:?}", raw.balloon_part.is_some());
                         }
                         
