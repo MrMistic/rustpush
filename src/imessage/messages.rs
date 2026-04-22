@@ -681,6 +681,9 @@ impl ExtensionApp {
             }
         }
 
+        if self.bundle_id == STICKERS_EXT_BID {
+            info!("STICKER OUT: ati plist (post-inject) = {:?}", plist_to_string(&val));
+        }
         let collapse = gzip(&plist_to_bin(&KeyedArchive::archive_item(val)?)?)?;
         let mut balloon = None;
         if let Some(balloon_obj) = &self.balloon {
