@@ -808,7 +808,7 @@ impl<P: AnisetteProvider> FindMyClient<P> {
     pub async fn new(conn: APSConnection, client: Arc<CloudKitClient<P>>, keychain: Arc<KeychainClient<P>>, config: Arc<dyn OSConfig>, state: Arc<FindMyStateManager>, token_provider: Arc<TokenProvider<P>>, anisette: ArcAnisetteClient<P>, identity: IdentityManager) -> Result<FindMyClient<P>, PushError> {
         let daemon = FindMyFriendsClient::new(config.as_ref(), state.state.lock().await.dsid.clone(), token_provider.clone(), conn.clone(), anisette.clone(), true).await?;
         Ok(FindMyClient {
-            _interest_token: conn.request_topics(&["com.apple.private.alloy.fmf", "com.apple.private.alloy.fmd", "com.apple.private.alloy.findmy.itemsharing-crossaccount"]).await,
+            _interest_token: conn.request_topics(&["com.apple.private.alloy.fmf", "com.apple.private.alloy.fmd", "com.apple.private.alloy.findmy.itemsharing-crossaccount", "com.apple.icloud.searchpartyd.securelocations"]).await,
             conn,
             identity,
             daemon: DebugMutex::new(daemon),
@@ -1134,7 +1134,158 @@ impl<P: AnisetteProvider> FindMyClient<P> {
         Ok(serde_json::from_slice(&description)?)
     }
 
+    /// Submit the device's own location to Apple's FindMy service.
+    /// This publishes the location so friends who follow this user can see it.
+    /// Uses the same endpoint and auth as beacon location fetching (`/findmyservice/v2/submit`).
+    ///
+    /// The location is encrypted using the device's beacon keys (same crypto as AirTag reports)
+    /// and submitted to Apple's servers where followers can fetch and decrypt it.
+    pub async fn submit_own_location(
+        &self,
+        latitude: f64,
+        longitude: f64,
+        altitude: f64,
+        horizontal_accuracy: f64,
+    ) -> Result<(), PushError> {
+        let state = self.state.state.lock().await;
+
+        // Get the first accessory's primary key to encrypt with
+        // (own device location uses the same key infrastructure as beacons)
+        let Some((device_id, accessory)) = state.accessories.iter().next() else {
+            return Err(PushError::KeyedArchiveError("No accessories/devices found for location submit".to_string()));
+        };
+
+        // Encode location as EncryptedReport format: lat*10^7 (i32 BE), lon*10^7 (i32 BE), accuracy (u8), status (u8)
+        let lat_encoded = (latitude * 10_000_000.0) as i32;
+        let lon_encoded = (longitude * 10_000_000.0) as i32;
+        let accuracy = (horizontal_accuracy.min(255.0)) as u8;
+        let status = 0u8; // 0 = normal
+
+        let plaintext = [
+            &lat_encoded.to_be_bytes()[..],
+            &lon_encoded.to_be_bytes()[..],
+            &[accuracy],
+            &[status],
+        ].concat();
+
+        // Generate an ephemeral key pair for ECDH
+        let group = EcGroup::from_curve_name(Nid::SECP224R1)?;
+        let ephemeral = EcKey::generate(&group)?;
+        let mut ctx = BigNumContext::new()?;
+        let ephemeral_pub_bytes = ephemeral.public_key().to_bytes(&group, openssl::ec::PointConversionForm::UNCOMPRESSED, &mut ctx)?;
+
+        // Derive the decryption key from the primary ratchet
+        let primary_key_bytes = &accessory.master_record.shared_secret;
+        let mut derived = vec![0u8; 72];
+        derive_key_into::<Sha256>(primary_key_bytes, b"diversify", &mut derived);
+
+        // Derive shared secret via ECDH with the accessory's public key
+        let adv_key = {
+            let mut secret = vec![0u8; 72];
+            derive_key_into::<Sha256>(primary_key_bytes, b"diversify", &mut secret);
+            let group = EcGroup::from_curve_name(Nid::SECP224R1)?;
+            let mut n = BigNum::new()?;
+            let mut ctx = BigNumContext::new()?;
+            group.order(&mut n, &mut ctx)?;
+            let u = BigNum::from_slice(&secret[..36])?;
+            let mut private_scalar = BigNum::new()?;
+            private_scalar.nnmod(&u, &n, &mut ctx)?;
+            private_scalar.add_word(1)?;
+            let mut pub_point = EcPoint::new(&group)?;
+            pub_point.mul_generator(&group, &private_scalar, &mut ctx)?;
+            EcKey::from_private_components(&group, &private_scalar, &pub_point)?
+        };
+
+        let adv_pkey = PKey::from_ec_key(adv_key)?;
+        let eph_pkey = PKey::from_ec_key(ephemeral.clone())?;
+
+        // ECDH: derive shared secret
+        let mut deriver = openssl::derive::Deriver::new(&eph_pkey)?;
+        deriver.set_peer(&adv_pkey)?;
+        let shared_secret = deriver.derive_to_vec()?;
+
+        // Derive symmetric key: SHA256(shared_secret || 0x00000001 || ephemeral_pub)
+        let symmetric = sha256(&[
+            &shared_secret[..],
+            &[0x00, 0x00, 0x00, 0x01],
+            &ephemeral_pub_bytes[..],
+        ].concat());
+
+        // Encrypt with AES-128-GCM
+        use aes_gcm::{Aes128Gcm, aead::Aead, KeyInit, Nonce};
+        let cipher = Aes128Gcm::new_from_slice(&symmetric[..16]).unwrap();
+        let nonce = Nonce::from_slice(&symmetric[16..28]);
+        let encrypted = cipher.encrypt(nonce, plaintext.as_ref())
+            .map_err(|_| PushError::KeyedArchiveError("AES-GCM encryption failed".to_string()))?;
+
+        // Build the payload: timestamp (4 bytes BE) + confidence (1 byte) + ephemeral_pub + encrypted
+        let apple_epoch_offset = 978307200u64;
+        let now_secs = duration_since_epoch().as_secs();
+        let apple_ts = (now_secs - apple_epoch_offset) as u32;
+
+        let payload_bytes = [
+            &apple_ts.to_be_bytes()[..],
+            &[100u8], // confidence = 100
+            &ephemeral_pub_bytes[..],
+            &encrypted[..],
+        ].concat();
+
+        let payload_b64 = base64_encode(&payload_bytes);
+
+        // Compute the advertisement key hash (same as used in fetch)
+        let mut x = BigNum::new()?;
+        let mut y = BigNum::new()?;
+        let adv_key_reconstructed = {
+            let mut secret = vec![0u8; 72];
+            derive_key_into::<Sha256>(primary_key_bytes, b"diversify", &mut secret);
+            let group = EcGroup::from_curve_name(Nid::SECP224R1)?;
+            let mut n = BigNum::new()?;
+            let mut ctx = BigNumContext::new()?;
+            group.order(&mut n, &mut ctx)?;
+            let u = BigNum::from_slice(&secret[..36])?;
+            let mut private_scalar = BigNum::new()?;
+            private_scalar.nnmod(&u, &n, &mut ctx)?;
+            private_scalar.add_word(1)?;
+            let mut pub_point = EcPoint::new(&group)?;
+            pub_point.mul_generator(&group, &private_scalar, &mut ctx)?;
+            EcKey::from_private_components(&group, &private_scalar, &pub_point)?
+        };
+        adv_key_reconstructed.public_key().affine_coordinates_gfp(adv_key_reconstructed.group(), &mut x, &mut y, &mut ctx)?;
+        let adv_id = base64_encode(&sha256(&x.to_vec_padded(28)?));
+
+        info!("[FMF-SUBMIT] Submitting own location: lat={}, lon={}, acc={}", latitude, longitude, horizontal_accuracy);
+        info!("[FMF-SUBMIT] Payload size: {} bytes, adv_id: {}", payload_bytes.len(), adv_id);
+
+        // Submit to Apple
+        let response: serde_json::Value = self.make_searchparty_request(
+            &state.dsid,
+            "https://gateway.icloud.com/findmyservice/v2/submit",
+            &json!({
+                "clientContext": {
+                    "clientBundleIdentifier": "com.apple.icloud.searchpartyuseragent",
+                    "policy": "foregroundClient",
+                },
+                "payloads": [{
+                    "id": adv_id,
+                    "locationInfo": [payload_b64],
+                }]
+            }),
+            None,
+        ).await?;
+
+        info!("[FMF-SUBMIT] Submit response: {:?}", response);
+        Ok(())
+    }
+
     pub async fn sync_item_positions(&self) -> Result<(), PushError> {
+        // === TEMPORARY TEST: Submit Montreal location when syncing item positions ===
+        info!("[FMF-SUBMIT] Triggering submit_own_location from sync_item_positions");
+        match self.submit_own_location(45.5017, -73.5673, 50.0, 10.0).await {
+            Ok(()) => info!("[FMF-SUBMIT] submit_own_location succeeded!"),
+            Err(e) => info!("[FMF-SUBMIT] submit_own_location failed: {:?}", e),
+        }
+        // === END TEMPORARY TEST ===
+
         self.sync_items(true).await?;
 
         let mut state = self.state.state.lock().await;
@@ -1605,7 +1756,7 @@ impl<P: AnisetteProvider> FindMyClient<P> {
     }
 
     pub async fn handle(&self, msg: APSMessage) -> Result<Vec<(String, String, BeaconAttributes)>, PushError> {
-        if let Some(IDSRecvMessage { message_unenc: Some(message), topic, token: Some(token), target: Some(target), sender: Some(sender), uuid: Some(uuid), ns_since_epoch: Some(ns_since_epoch), .. }) = self.identity.receive_message(msg, &["com.apple.private.alloy.fmf", "com.apple.private.alloy.fmd", "com.apple.private.alloy.findmy.itemsharing-crossaccount"]).await? {
+        if let Some(IDSRecvMessage { message_unenc: Some(message), topic, token: Some(token), target: Some(target), sender: Some(sender), uuid: Some(uuid), ns_since_epoch: Some(ns_since_epoch), .. }) = self.identity.receive_message(msg, &["com.apple.private.alloy.fmf", "com.apple.private.alloy.fmd", "com.apple.private.alloy.findmy.itemsharing-crossaccount", "com.apple.icloud.searchpartyd.securelocations"]).await? {
             let do_app_ack = || async {
                 let targets = self.identity.cache.lock().await.get_targets(&topic, &target, &[sender.clone()], &[MessageTarget::Token(token)])?;
                 self.identity.send_message(topic, IDSSendMessage {
@@ -1668,6 +1819,39 @@ impl<P: AnisetteProvider> FindMyClient<P> {
                 }
                 return Ok(vec![])
             }
+
+            // === SECURE LOCATIONS: Log incoming location requests ===
+            // Secure locations uses com.apple.private.alloy.fmd as its IDS channel.
+            // We intercept fmd messages that fail to parse as FMFPayload.
+            if topic == "com.apple.private.alloy.fmd" {
+                let parsed_result: Result<FMFPayload, _> = message.plist();
+                match parsed_result {
+                    Ok(parsed) => {
+                        // Regular FMF message — handle normally
+                        debug!("Find my IDS message came in as {}", encode_hex(&uuid));
+                        match parsed {
+                            FMFPayload::MappingPacket { p } => {
+                                do_app_ack().await?;
+                                debug!("Importing find my token {p}!");
+                                self.daemon.lock().await.import(self.config.as_ref(), &p).await?;
+                                debug!("Imported find my token {p}!");
+                            }
+                        }
+                        return Ok(vec![])
+                    },
+                    Err(_) => {
+                        // NOT a regular FMF message — likely a secure location message!
+                        info!("[FMF-SECURE-LOC] Received non-FMF message on fmd topic!");
+                        info!("[FMF-SECURE-LOC] Sender: {}", sender);
+                        info!("[FMF-SECURE-LOC] Target: {}", target);
+                        info!("[FMF-SECURE-LOC] (Could not parse as FMFPayload — this may be a secure location request)");
+                        do_app_ack().await?;
+                        return Ok(vec![])
+                    }
+                }
+            }
+            // === END SECURE LOCATIONS ===
+
             let parsed: FMFPayload = message.plist()?;
             debug!("Find my IDS message came in as {}", encode_hex(&uuid));
             match parsed {
@@ -1984,11 +2168,20 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
 
         let response = request.json(&req).send().await?;
 
+        if self.daemon {
+            info!("[FMF-TEST] HTTP status: {}", response.status().as_u16());
+        }
+
         if response.status().as_u16() == 401 {
             self.token_provider.refresh_mme().await?;
         }
 
         let raw_request: serde_json::Value = response.json().await?;
+
+        if self.daemon {
+            info!("[FMF-TEST] Raw response body: {}", 
+                serde_json::to_string(&raw_request).unwrap_or_else(|_| "parse error".to_string()));
+        }
 
         let request: FindMyFriendsStateUpdate = serde_json::from_value(raw_request.clone())?;
 
@@ -2057,13 +2250,171 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
             let _ = self.make_request::<serde_json::Value>(config, if self.daemon { "initClient" } else { "first/initClient" }, json!({})).await?;
             self.has_init = true;
         } else {
-            let _ = self.make_request::<serde_json::Value>(config, if self.selected_friend.is_some() { "minCallback/selFriend/refreshClient" } else { "minCallback/refreshClient" }, json!({})).await?;
+            // === TEMPORARY TEST: submit location via /findmyservice/v2/submit ===
+            if !self.daemon {
+                // Only trigger once from the non-daemon client (the one the alpha app uses)
+                static SUBMITTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !SUBMITTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    info!("[FMF-SUBMIT] Attempting standalone submit from FindMyFriendsClient");
+                    match self.submit_location_standalone(config, 45.5017, -73.5673, 50.0, 10.0).await {
+                        Ok(()) => info!("[FMF-SUBMIT] Standalone submit succeeded!"),
+                        Err(e) => info!("[FMF-SUBMIT] Standalone submit failed: {:?}", e),
+                    }
+                }
+            }
+            // === END TEMPORARY TEST ===
+
+            let path = if self.selected_friend.is_some() { "minCallback/selFriend/refreshClient" } else { "minCallback/refreshClient" };
+            match self.make_request::<serde_json::Value>(config, path, json!({})).await {
+                Ok(response) => {
+                    // Only log occasionally to avoid spam
+                },
+                Err(e) => {
+                    log::error!("[FMF-TEST] refreshClient FAILED: {:?}", e);
+                    return Err(e);
+                }
+            }
         }
         Ok(())
     }
 
     pub async fn import(&mut self, config: &dyn OSConfig, url: &str) -> Result<(), PushError> {
         let _ = self.make_request::<serde_json::Value>(config, "import", json!({"url": url})).await?;
+        Ok(())
+    }
+
+    /// Attempt to post location by impersonating the meDeviceId (iPad) in the FMF daemon request.
+    /// Uses the existing mmeFMFAppToken but sends the request as if from the iPad.
+    pub async fn submit_location_standalone(
+        &self,
+        config: &dyn OSConfig,
+        latitude: f64,
+        longitude: f64,
+        _altitude: f64,
+        _horizontal_accuracy: f64,
+    ) -> Result<(), PushError> {
+        let token = self.token_provider.get_mme_token("mmeFMFAppToken").await?;
+        info!("[FMF-SUBMIT] Got mmeFMFAppToken, attempting iPad impersonation");
+
+        // The iPad ECID (current meDeviceId from the FMF response)
+        let ipad_ecid = "00008112-0001253C0A3BA01E";
+        
+        let ms_since_epoch = duration_since_epoch().as_millis() as f64 / 1000f64;
+        let aps_token = encode_hex(&self.aps.get_token().await).to_uppercase();
+
+        // Build the request as if from the iPad fmfd daemon
+        let body = json!({
+            "clientContext": {
+                "appName": "fmfd",
+                "appVersion": "7.0",
+                "apsToken": aps_token,
+                "countryCode": "US",
+                "currentTime": ms_since_epoch,
+                "deviceClass": "iPad",
+                "deviceHasPasscode": true,
+                "deviceUDID": ipad_ecid.to_lowercase(),
+                "fencingEnabled": true,
+                "isFMFAppRemoved": false,
+                "osVersion": "17.7.6",
+                "platform": "iphoneos",
+                "productType": "iPad8,3",
+                "regionCode": "US",
+                "timezone": "PST, -28800",
+                "unlockState": 0,
+            },
+            "myLocation": {
+                "latitude": latitude,
+                "longitude": longitude,
+                "altitude": _altitude,
+                "horizontalAccuracy": _horizontal_accuracy,
+                "verticalAccuracy": 5.0,
+                "timestamp": duration_since_epoch().as_millis() as i64,
+                "floorLevel": 0,
+                "isInaccurate": false,
+                "positionType": "GPS",
+                "isOld": false,
+                "locationFinished": true,
+            },
+            "serverContext": self.server_context.clone(),
+            "dataContext": self.data_context.clone(),
+        });
+
+        // Use the iPad ECID in the URL path
+        let url = format!("https://p{}-fmfmobile.icloud.com/fmipservice/friends/fmfd/{}/{}/minCallback/refreshClient", 
+            self.server, self.dsid, ipad_ecid.to_uppercase());
+
+        info!("[FMF-SUBMIT] URL: {}", url);
+        info!("[FMF-SUBMIT] myLocation: lat={}, lon={}", latitude, longitude);
+
+        let response = REQWEST.post(&url)
+            .header("X-FMF-Model-Version", "1")
+            .header("Content-Type", "application/json")
+            .basic_auth(&self.dsid, Some(&token))
+            .json(&body)
+            .send().await?;
+
+        let status = response.status().as_u16();
+        let response_body = response.text().await.unwrap_or_else(|_| "failed to read body".to_string());
+        info!("[FMF-SUBMIT] Response status: {}", status);
+        info!("[FMF-SUBMIT] Response body (first 500): {}", &response_body[..response_body.len().min(500)]);
+
+        Ok(())
+    }
+
+    /// Post the device's current GPS coordinates to Apple's FMF server.
+    /// This makes the device appear as a trackable location source for friends
+    /// who are "following" this user in Find My.
+    ///
+    /// Requires daemon mode to be enabled (the client must be initialized with daemon=true).
+    /// The location field name is an educated guess based on the existing protocol structure —
+    /// if Apple uses a different field name, this will need to be updated after protocol capture.
+    pub async fn post_location(
+        &mut self,
+        config: &dyn OSConfig,
+        latitude: f64,
+        longitude: f64,
+        altitude: f64,
+        horizontal_accuracy: f64,
+        vertical_accuracy: f64,
+    ) -> Result<(), PushError> {
+        if !self.daemon {
+            return Err(PushError::KeyedArchiveError("Location posting requires daemon mode".to_string()));
+        }
+
+        // Ensure we've initialized the daemon session first
+        if !self.has_init {
+            let _ = self.make_request::<serde_json::Value>(config, "initClient", json!({})).await?;
+            self.has_init = true;
+        }
+
+        let ms_since_epoch = duration_since_epoch().as_millis() as i64;
+
+        // Construct the location payload matching the Location struct format
+        // that Apple's server returns for friends' locations.
+        // Field name "myLocation" is an educated guess — alternatives:
+        // "currentLocation", "location", or embedded in clientContext.
+        let location_data = json!({
+            "myLocation": {
+                "latitude": latitude,
+                "longitude": longitude,
+                "altitude": altitude,
+                "horizontalAccuracy": horizontal_accuracy,
+                "verticalAccuracy": vertical_accuracy,
+                "timestamp": ms_since_epoch,
+                "floorLevel": 0,
+                "isInaccurate": vertical_accuracy+horizontal_accuracy > 100.0,
+                "positionType": "GPS",
+                "isOld": false,
+                "locationFinished": true,
+            }
+        });
+
+        let _ = self.make_request::<serde_json::Value>(
+            config,
+            "minCallback/refreshClient",
+            location_data,
+        ).await?;
+
         Ok(())
     }
 }
