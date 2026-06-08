@@ -444,6 +444,12 @@ struct RawIMessage {
     low_res_wallpaper_tag: Option<Data>,
     #[serde(rename = "nWMK")]
     wallpaper_message_tag: Option<Data>,
+    /// Associated reply context — empty string signals standalone sticker to recipient.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arc: Option<String>,
+    /// Associated reply emoji — empty string signals standalone sticker to recipient.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    are: Option<String>,
 }
 
 

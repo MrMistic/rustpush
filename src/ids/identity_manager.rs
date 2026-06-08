@@ -793,7 +793,19 @@ impl IdentityResource {
                 }
             };
 
-            let decrypted = self.identity.decrypt_payload(ident.as_ref(), &encryption, &message)?;
+            let decrypted = match self.identity.decrypt_payload(ident.as_ref(), &encryption, &message) {
+                Ok(d) => d,
+                Err(e) => {
+                    // Surface decrypt failures so an inbound message that arrived on a known
+                    // topic but couldn't be decrypted is distinguishable from "never arrived".
+                    // Without this the error propagates silently out of the caller's handle()
+                    // and the message looks like it was never delivered. (e.g. an inbound
+                    // secureLocationsKeyUpdate T:10 on com.apple.private.alloy.fmd that fails here
+                    // would otherwise leave zero trace past the debug "ID got message" line.)
+                    error!("[IDS-RECV] decrypt FAILED on topic {} from {}: {:?}", topic, sender, e);
+                    return Err(e);
+                }
+            };
             let ungzipped = ungzip(&decrypted).unwrap_or_else(|_| decrypted);
 
             payload.message_unenc = Some(MessageBody::Bytes(ungzipped));
@@ -1122,7 +1134,7 @@ impl InnerSendJob {
                 command: message.command,
                 encryption: if !matches!(message.raw, Raw::None) { Some("pair".to_string()) } else { None },
                 user_agent: self.user_agent.clone(),
-                v: if !is_relay_message { Some(if self.topic == "com.apple.private.alloy.sms" { 1850 } else { 8 }) } else { None },
+                v: if !is_relay_message { Some(if self.topic == "com.apple.private.alloy.sms" { 1850 } else { 26004000 }) } else { None },
                 message_id: msg_id,
                 uuid: uuid.clone().into(),
                 payloads: group,

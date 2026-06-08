@@ -404,10 +404,47 @@ async fn main() {
         let pet = account.get_pet().unwrap();
         let spd = account.spd.as_ref().unwrap();
 
-        let delegates = login_apple_delegates(&gsa.user, &pet, spd["adsid"].as_string().unwrap(), None, &mut *anisette_client.lock().await, config.as_ref(), &[LoginDelegate::IDS, LoginDelegate::MobileMe]).await.unwrap();
+        let delegates = login_apple_delegates(&*account, None, config.as_ref(), &[LoginDelegate::IDS, LoginDelegate::MobileMe]).await.unwrap();
         let user = authenticate_apple(delegates.ids.unwrap(), config.as_ref()).await.unwrap();
 
         let mobileme = delegates.mobileme.unwrap();
+        
+        // Print available tokens
+        println!("\n=== Available MobileMe Tokens ===");
+        for (name, _value) in &mobileme.tokens {
+            println!("  Token: {} (length: {})", name, _value.len());
+        }
+        println!("=================================\n");
+        
+        // Check for searchPartyToken specifically
+        if let Some(spt) = mobileme.tokens.get("searchPartyToken") {
+            println!("[FMF-SUBMIT] searchPartyToken FOUND! Length: {}", spt.len());
+            println!("[FMF-SUBMIT] Testing submit endpoint...");
+            
+            let dsid = spd["DsPrsId"].as_unsigned_integer().unwrap().to_string();
+            let client = reqwest::Client::new();
+            let resp = client.post("https://gateway.icloud.com/findmyservice/v2/submit")
+                .basic_auth(&dsid, Some(spt))
+                .header("Content-Type", "application/json")
+                .header("accept-version", "4")
+                .header("user-agent", "searchpartyuseragent/1 iMac13,1/13.6.4")
+                .header("x-apple-i-device-type", "1")
+                .json(&serde_json::json!({
+                    "clientContext": {
+                        "clientBundleIdentifier": "com.apple.icloud.searchpartyuseragent",
+                        "policy": "foregroundClient",
+                    },
+                    "payloads": []
+                }))
+                .send().await.unwrap();
+            
+            println!("[FMF-SUBMIT] Response status: {}", resp.status());
+            let body = resp.text().await.unwrap();
+            println!("[FMF-SUBMIT] Response body: {}", &body[..body.len().min(500)]);
+        } else {
+            println!("[FMF-SUBMIT] searchPartyToken NOT FOUND in delegate response");
+        }
+
         let findmy = FindMyState::new(spd["DsPrsId"].as_unsigned_integer().unwrap().to_string());
 
         let id_path = PathBuf::from_str("findmy.plist").unwrap();
@@ -608,7 +645,7 @@ async fn main() {
     let passwords = PasswordManager::new(
         keychain.clone(), cloudkit.clone(), client.identity.clone(), connection.clone(), state, Box::new(move |state| {
             plist::to_file_xml("passwords.plist", state).unwrap();
-        })).await;
+        }), Box::new(|_, _| {})).await;
 
 
     if let Some(mut s) = session {

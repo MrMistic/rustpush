@@ -1052,6 +1052,13 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
     };
 
     let services = id_services.iter().map(|service| {
+        // Log the per-service client-data capability keys actually being registered, so we can
+        // confirm from device logs that capabilities like supports-secure-loc-v1 are published
+        // on the wire (not just present in the struct). Values are static booleans; keys suffice.
+        let cap_keys: Vec<&str> = service.client_data.iter().map(|(k, _)| *k).collect();
+        info!("[IDS-REG] service={} sub_services={:?} client_data_keys={:?}",
+            service.name, service.sub_services, cap_keys);
+
         let mut user_list = vec![];
         let mut sim_count = 0;
         for user in users.iter() {
