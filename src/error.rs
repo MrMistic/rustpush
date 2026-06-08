@@ -98,6 +98,8 @@ pub enum PushError {
     RelayError(u16, String),
     #[error("Relay device offline!")]
     DeviceNotFound,
+    #[error("This device cannot produce fmip identityV5 signing material (no relay/hardware identity)")]
+    FmipBridgeUnsupported,
     #[error("Web Tunnel error {0}!")]
     WebTunnelError(u16),
     #[error("APS Ack error {0}!")]

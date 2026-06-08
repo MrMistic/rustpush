@@ -5,11 +5,33 @@ use async_trait::async_trait;
 use plist::{Dictionary, Value};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use crate::{activation::ActivationInfo, util::{base64_decode, REQWEST}, DebugMeta, OSConfig, PushError, RegisterMeta};
+use crate::{activation::ActivationInfo, util::{base64_decode, base64_encode, encode_hex, REQWEST}, DebugMeta, FmipDeviceHardware, FmipSignature, OSConfig, PushError, RegisterMeta};
 
 #[derive(Deserialize)]
 pub struct DataResp {
     data: String,
+}
+
+/// Response of the relay bridge `POST /api/v1/bridge/get-pcrt-token` endpoint
+/// (IDENTITYV5_PLAN.md Task 2). Wraps `MAECopyPCRTToken()`.
+#[derive(Deserialize)]
+struct FmipPcrtResp {
+    pcrt: String,
+}
+
+/// Response of `POST /api/v1/bridge/fmip/sign`. The relay produces these via
+/// `FMDAbsintheV3SigningInterface signatureForData:` (must run inside/attached to
+/// findmydeviced context — see IDENTITYV5_PLAN.md §Task 2 correction).
+#[derive(Deserialize)]
+struct FmipSignResp {
+    sign1: String,
+    sign2: String,
+    #[serde(default)]
+    sign5: Option<String>,
+    #[serde(default)]
+    sign6: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -25,6 +47,29 @@ pub struct Versions {
     serial_number: String,
     hardware_version: String,
     unique_device_id: String,
+
+    // --- fmip identityV5 hardware descriptor (IDENTITYV5_PLAN.md Task 2/3) ---
+    // Optional so existing relays (which don't emit these) still deserialize.
+    // A relay bridge that supports identityV5 populates them from its activation
+    // record + MobileGestalt. `ecid`/`chip_id` are the pre-formatted `0x%llx`
+    // strings the wire uses. When absent, the identityV5 path stays inert.
+    #[serde(default)]
+    imei: Option<String>,
+    #[serde(default)]
+    imei2: Option<String>,
+    #[serde(default)]
+    meid: Option<String>,
+    #[serde(default)]
+    ecid: Option<String>,
+    #[serde(default)]
+    chip_id: Option<String>,
+    #[serde(default)]
+    wifi_mac: Option<String>,
+    #[serde(default)]
+    bt_mac: Option<String>,
+    /// `pscSUILastModified` (ms) for the identityV5 deviceInfo. Optional.
+    #[serde(default)]
+    psc_sui_last_modified: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -88,6 +133,9 @@ impl OSConfig for RelayConfig {
         self.udid.clone().expect("missing udid!")
     }
 
+    fn get_hardware_udid(&self) -> String {
+        self.version.unique_device_id.clone()
+    }
     fn get_normal_ua(&self, item: &str) -> String {
         let part = self.icloud_ua.split_once(char::is_whitespace).unwrap().0;
         format!("{item} {part}")
@@ -168,6 +216,90 @@ impl OSConfig for RelayConfig {
         let result: DataResp = result.json().await?;
 
         Ok(base64_decode(&result.data))
+    }
+
+    fn get_fmip_device_hardware(&self) -> Option<FmipDeviceHardware> {
+        // Requires the relay bridge to have populated the identityV5 hardware
+        // fields. `ecid`/`chipId` are the load-bearing ones (the server needs the
+        // silicon identity); gate on ecid being present.
+        let ecid = self.version.ecid.clone()?;
+        Some(FmipDeviceHardware {
+            serial_number: self.version.serial_number.clone(),
+            imei: self.version.imei.clone().unwrap_or_default(),
+            imei2: self.version.imei2.clone().unwrap_or_default(),
+            meid: self.version.meid.clone().unwrap_or_default(),
+            ecid,
+            chip_id: self.version.chip_id.clone().unwrap_or_default(),
+            wifi_mac: self.version.wifi_mac.clone().unwrap_or_default(),
+            bt_mac: self.version.bt_mac.clone().unwrap_or_default(),
+        })
+    }
+
+    async fn get_fmip_pcrt_token(&self) -> Result<String, PushError> {
+        // The registration server maps the URL path segment directly to the relay
+        // websocket command verb (e.g. get-version-info). So the segment MUST equal
+        // the relay's poll() command name exactly, with no extra slash.
+        let mut data = REQWEST.post(format!("{}/api/v1/bridge/get-pcrt-token", self.host))
+            .bearer_auth(&self.code)
+            .header("Content-Length", "0");
+        if let Some(token) = &self.beeper_token {
+            data = data.header("X-Beeper-Access-Token", token.clone());
+        }
+
+        let result = data.send().await?;
+        match result.status().as_u16() {
+            200 => {},
+            // Older relays without the fmip bridge return 404 -> unsupported.
+            404 => return Err(PushError::FmipBridgeUnsupported),
+            status => return Err(PushError::RelayError(status, result.text().await?)),
+        }
+
+        let result: FmipPcrtResp = result.json().await?;
+        Ok(result.pcrt)
+    }
+
+    async fn get_fmip_signature(&self, digest: &[u8], request_uuid: &str) -> Result<FmipSignature, PushError> {
+        // The beeper registration server (internal/api/routes.go bridgeExecuteCommand)
+        // forwards ONLY the URL path segment as the relay websocket command name — it
+        // never reads the HTTP request body (confirmed from source + the DIAG that
+        // returned `raw data=null`). All other bridge commands are parameterless for
+        // this reason. So we encode the fmip-sign parameters INTO the command segment:
+        //     fmip-sign.<digest_hex>.<request_uuid>
+        // - digest_hex: 64 lowercase hex chars (URL-safe; no '/','+','=' like base64).
+        // - request_uuid: standard UUID (hex + '-'); '.' separates and appears in
+        //   neither hex nor a UUID, so the relay splits unambiguously.
+        // chi's {command} wildcard matches any non-'/' run (incl. '.'), so the whole
+        // string arrives at the relay verbatim as the command name. The relay
+        // prefix-matches "fmip-sign." and parses the two fields back out.
+        let digest_hex = encode_hex(digest);
+        let segment = format!("fmip-sign.{}.{}", digest_hex, request_uuid);
+
+        let mut data = REQWEST.post(format!("{}/api/v1/bridge/{}", self.host, segment))
+            .bearer_auth(&self.code)
+            .header("Content-Length", "0");
+        if let Some(token) = &self.beeper_token {
+            data = data.header("X-Beeper-Access-Token", token.clone());
+        }
+
+        let result = data.send().await?;
+        match result.status().as_u16() {
+            200 => {},
+            404 => return Err(PushError::FmipBridgeUnsupported),
+            status => return Err(PushError::RelayError(status, result.text().await?)),
+        }
+
+        let result: FmipSignResp = result.json().await?;
+        if let Some(err) = result.error {
+            // The signing engine itself reported a failure (e.g. PSC session /
+            // Cadmium round-trip failed). Surface it rather than sending a bad sig.
+            return Err(PushError::RelayError(0, format!("fmip sign error: {}", err)));
+        }
+        Ok(FmipSignature {
+            sign1: result.sign1,
+            sign2: result.sign2,
+            sign5: result.sign5,
+            sign6: result.sign6,
+        })
     }
 
     fn get_register_meta(&self) -> RegisterMeta {

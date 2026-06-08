@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+# Opt-in feature for stale scratch binaries left over from earlier
+# investigation work (`src/bin/test_submit.rs`, `src/bin/get_token.rs`).
+# These don't currently compile against the main crate API but are kept
+# in case they're useful later. Enable explicitly with --features dev-bins
+# to build them and find out what needs updating.
+dev-bins = []
 remote-anisette-v3 = ["omnisette/remote-anisette-v3", "icloud_auth/remote-anisette-v3"]
 remote-clearadi = ["omnisette/remote-clearadi", "icloud_auth/remote-clearadi"]
 macos-validation-data = ["dep:open-absinthe"]
@@ -57,6 +63,9 @@ chrono = "0.4.41"
 bitflags = "2.9.1"
 x509-cert = "0.2.5"
 
+[dev-dependencies]
+proptest = "1.4"
+
 [build-dependencies]
 prost-build = { version = "0.12.0" }
 
@@ -64,6 +73,17 @@ prost-build = { version = "0.12.0" }
 name = "rustpush-test"
 required-features = ["macos-validation-data"]
 path = "src/test.rs"
+
+# Stale scratch binaries — don't compile by default. See `dev-bins` feature note.
+[[bin]]
+name = "test_submit"
+required-features = ["dev-bins"]
+path = "src/bin/test_submit.rs"
+
+[[bin]]
+name = "get_token"
+required-features = ["dev-bins"]
+path = "src/bin/get_token.rs"
 
 [lib]
 name = "rustpush"

@@ -2,12 +2,14 @@ syntax = "proto2";
 package notestore;
 
 message NoteStoreProto {
+  optional uint32 unk = 1;
   optional Document document = 2;
 }
 
 message Document {
-  optional Note note = 1;
-  optional uint32 version = 2;
+  optional uint32 version = 1;
+  optional uint32 unk2 = 2;
+  optional Note note = 3;
 }
 
 message Note {

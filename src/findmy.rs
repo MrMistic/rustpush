@@ -1,4 +1,4 @@
-use std::{collections::HashMap, str::FromStr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}, u8};
+use std::{collections::HashMap, str::FromStr, sync::{Arc, atomic::{AtomicI64, Ordering}}, time::{Duration, SystemTime, UNIX_EPOCH}, u8};
 
 use aes::{cipher::consts::U16, Aes128, Aes256};
 use aes_gcm::{Aes256Gcm, AesGcm, Nonce, Tag, aead::{Aead, AeadMutInPlace}};
@@ -23,6 +23,8 @@ use uuid::Uuid;
 use crate::{CompactECKey, cloudkit::{DeleteRecordOperation, SaveRecordOperation, should_reset}, ids::user::QueryOptions, util::{DebugMutex, base64_decode, base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, decode_hex, plist_to_bin}};
 use crate::{aps::APSInterestToken, auth::{MobileMeDelegateResponse, TokenProvider}, cloudkit::{pcs_keys_for_record, record_identifier, CloudKitClient, CloudKitContainer, CloudKitOpenContainer, CloudKitSession, FetchRecordChangesOperation, FetchRecordOperation, ALL_ASSETS, NO_ASSETS}, ids::{identity_manager::{DeliveryHandle, IDSSendMessage, IdentityManager, MessageTarget, Raw}, user::IDSService, IDSRecvMessage}, keychain::{derive_key_into, KeychainClient}, login_apple_delegates, pcs::PCSService, util::{duration_since_epoch, encode_hex, REQWEST}, APSConnection, APSMessage, LoginDelegate, OSConfig, PushError};
 
+pub mod fmip_register;
+
 pub const MULTIPLEX_SERVICE: IDSService = IDSService {
     name: "com.apple.private.alloy.multiplex1",
     sub_services: &[
@@ -39,10 +41,90 @@ pub const MULTIPLEX_SERVICE: IDSService = IDSService {
         ("supports-findmy-plugin-messages", Value::Boolean(true)),
         ("supports-beacon-sharing-v3", Value::Boolean(true)),
         ("supports-beacon-sharing-v2", Value::Boolean(true)),
+        // Required so friends' devices recognize us as a valid secure-locations target and
+        // deliver the inbound secureLocationsKeyUpdate (T:10). The outbound T:10 is sent with
+        // IDSSendMessageOptionRequireAllRegistrationProperties = {("supports-secure-loc-v1")},
+        // so without advertising this our handle is silently skipped as a delivery target and
+        // friend_secure_keys never gets populated. (Real iOS devices advertise this — confirmed
+        // present 53x in friends' delivery-data lookups in the device log.)
+        ("supports-secure-loc-v1", Value::Boolean(true)),
     ],
     flags: 1,
     capabilities_name: "com.apple.private.alloy"
 };
+
+/// Minimum interval between *automatic* `publish_secure_location` triggers,
+/// in milliseconds. The manual UI button (testPublishSecureLocation) bypasses
+/// this — it calls `publish_secure_location` directly, not via the trigger
+/// sites that consult this gate.
+///
+/// Real iOS publishes "shallow" locations every few minutes; we land at 5 min
+/// to be conservative without being so slow that the user can't see updates
+/// land within a reasonable test session. INVESTIGATION.md §25 saw repeated
+/// submits get 428 ACL Check Failed (suspected rate-limit / anti-replay), so
+/// the minimum exists primarily to avoid hammering Apple while the protocol
+/// is still being characterized.
+const FMF_AUTO_PUBLISH_MIN_INTERVAL_MS: i64 = 5 * 60 * 1000;
+
+/// Last automatic `publish_secure_location` timestamp (Unix ms). 0 = never.
+/// Module-level so both `sync_item_positions` and `refresh_background_following`
+/// (in the FFI crate) share the same gate.
+static FMF_LAST_AUTO_PUBLISH_MS: AtomicI64 = AtomicI64::new(0);
+
+/// Returns true if enough time has elapsed since the last successful auto-publish
+/// for another one to fire. On `true`, atomically updates the timestamp so that
+/// concurrent triggers don't both pass through.
+///
+/// Designed to be called *only* from the autonomous trigger sites
+/// (`sync_item_positions`, `refresh_background_following`). Manual / UI publishes
+/// should not consult this gate.
+pub fn fmf_auto_publish_should_fire() -> bool {
+    let now_ms = duration_since_epoch().as_millis() as i64;
+    let last = FMF_LAST_AUTO_PUBLISH_MS.load(Ordering::Relaxed);
+    if last != 0 && now_ms.saturating_sub(last) < FMF_AUTO_PUBLISH_MIN_INTERVAL_MS {
+        return false;
+    }
+    // Try to claim the slot. If a concurrent caller beat us to it, back off.
+    FMF_LAST_AUTO_PUBLISH_MS
+        .compare_exchange(last, now_ms, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
+}
+
+/// Minimum interval between *keyless* subscribe attempts for a SINGLE friend, in
+/// milliseconds. The keyed pull (friends we already hold a key for) is NOT gated —
+/// it runs every fetch cycle so locations stay fresh.
+///
+/// A keyless subscribe ("ids":[] for a friend we have no key for) is only the
+/// trigger that asks Apple to push `distributeKeys` to that publisher; once we hold
+/// their key the keyless path is no longer used for them. Running it every 5s for
+/// every unkeyed friend would hammer Apple needlessly, so each unkeyed friend is
+/// throttled to one keyless subscribe per this interval. ~30s balances "key arrives
+/// quickly after the map opens" against request volume, and is robust to the ~10%
+/// of cycles where MME refresh fails (a once-on-open trigger would miss those).
+const FMF_SUBSCRIBE_MIN_INTERVAL_MS: i64 = 30 * 1000;
+
+/// Per-friend (keyed by findMyId / Follow.id) last keyless-subscribe timestamp in
+/// Unix ms. Module-level so the gate persists across `fetch_locations` calls.
+static FMF_LAST_SUBSCRIBE_MS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, i64>>> =
+    std::sync::OnceLock::new();
+
+/// Returns true if a keyless subscribe should fire for `fm_id` now (enough time has
+/// elapsed since its last keyless subscribe). On `true`, records `now` as the new
+/// last-subscribe time for that friend so the next cycle within the window is gated.
+fn fmf_subscribe_should_fire(fm_id: &str) -> bool {
+    let now_ms = duration_since_epoch().as_millis() as i64;
+    let map = FMF_LAST_SUBSCRIBE_MS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = match map.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let last = guard.get(fm_id).copied().unwrap_or(0);
+    if last != 0 && now_ms.saturating_sub(last) < FMF_SUBSCRIBE_MIN_INTERVAL_MS {
+        return false;
+    }
+    guard.insert(fm_id.to_string(), now_ms);
+    true
+}
 
 #[derive(Deserialize, Serialize, Default, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -119,6 +201,48 @@ pub struct FindMyState {
     pub accessories: HashMap<String, BeaconAccessory>,
     #[serde(default)]
     pub share_state: FindMyShareState,
+    /// Publisher's P-224 private key scalar (28 bytes) for secure location sharing.
+    /// Generated once on first access, persisted across sessions.
+    #[serde(serialize_with = "bin_serialize_opt_vec", deserialize_with = "bin_deserialize_opt_vec", default)]
+    pub secure_locations_private_key: Option<Vec<u8>>,
+    /// Publisher's P-224 public key (57 bytes, uncompressed SEC1: 0x04 || x || y).
+    /// Paired with secure_locations_private_key above.
+    #[serde(serialize_with = "bin_serialize_opt_vec", deserialize_with = "bin_deserialize_opt_vec", default)]
+    pub secure_locations_public_key: Option<Vec<u8>>,
+    /// AES-256 symmetric key (32 bytes) that friends use to decrypt our published locations.
+    /// Shared with friends via MappingPacket.
+    #[serde(serialize_with = "bin_serialize_opt_vec", deserialize_with = "bin_deserialize_opt_vec", default)]
+    pub secure_locations_shared_secret: Option<Vec<u8>>,
+    /// Per-friend key material received from inbound MappingPackets.
+    /// Key: friend's IDS handle (e.g. "tel:+1234567890" or sender from IDS message)
+    /// Value: FriendSecureLocationKeys containing their pubkey + shared secret
+    #[serde(default)]
+    pub friend_secure_keys: HashMap<String, FriendSecureLocationKeys>,
+}
+
+/// Key material for decrypting a FRIEND's published secure locations.
+///
+/// Received from an inbound `secureLocationsKeyUpdate` (T:10) IDS message that the
+/// friend sends us when they share their location. The friend hands us THEIR OWN
+/// private key so we can fetch + decrypt the locations they publish under their key_id.
+/// (Proven from keyupdate-capture2.log — see SESSION_2026_06_12_RECEIVE_FINDINGS.md.)
+#[derive(Serialize, Deserialize, Clone)]
+pub struct FriendSecureLocationKeys {
+    /// Friend's P-224 private key scalar (28 bytes) — handed to us in their key update.
+    /// This is what we decrypt their location blobs with.
+    #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
+    pub private_key: Vec<u8>,
+    /// Friend's P-224 public key (57 bytes, uncompressed SEC1: 0x04 || x || y).
+    #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
+    pub public_key: Vec<u8>,
+    /// Friend's AES-256 shared secret (32 bytes) — legacy/vestigial under the ECIES model.
+    /// Kept for serialization compatibility; not used for ECIES decrypt.
+    #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize", default)]
+    pub shared_secret: Vec<u8>,
+    /// Friend's findMyId (= base64(their DSID) = their Follow.id). Used to map decrypted
+    /// locations back to the correct friend.
+    #[serde(default)]
+    pub find_my_id: String,
 }
 
 impl FindMyState {
@@ -128,7 +252,65 @@ impl FindMyState {
             state_token: None,
             accessories: Default::default(),
             share_state: Default::default(),
+            secure_locations_private_key: None,
+            secure_locations_public_key: None,
+            secure_locations_shared_secret: None,
+            friend_secure_keys: Default::default(),
         }
+    }
+
+    /// Returns (private_key[28], public_key[57], shared_secret[32]).
+    /// Generates once on first call, then persists in state. Caller must save
+    /// the state after this returns if it generated new keys.
+    pub fn get_or_generate_secure_location_keys(&mut self) -> Result<([u8; 28], [u8; 57], [u8; 32]), PushError> {
+        if let (Some(priv_key), Some(pub_key), Some(shared)) = (
+            &self.secure_locations_private_key,
+            &self.secure_locations_public_key,
+            &self.secure_locations_shared_secret,
+        ) {
+            info!("[FMF-MAPPING] Using existing persisted secure location keys");
+            let priv_arr: [u8; 28] = priv_key.clone().try_into()
+                .map_err(|_| PushError::KeyedArchiveError("persisted private key not 28 bytes".to_string()))?;
+            let pub_arr: [u8; 57] = pub_key.clone().try_into()
+                .map_err(|_| PushError::KeyedArchiveError("persisted public key not 57 bytes".to_string()))?;
+            let secret_arr: [u8; 32] = shared.clone().try_into()
+                .map_err(|_| PushError::KeyedArchiveError("persisted shared secret not 32 bytes".to_string()))?;
+            return Ok((priv_arr, pub_arr, secret_arr));
+        }
+
+        info!("[FMF-MAPPING] Generating new P-224 keypair + shared secret for secure locations");
+
+        // Generate P-224 keypair
+        let group = EcGroup::from_curve_name(Nid::SECP224R1)?;
+        let keypair = EcKey::generate(&group)?;
+        keypair.check_key()?;
+
+        // Extract private scalar (28 bytes)
+        let priv_bytes = keypair.private_key().to_vec_padded(28)
+            .map_err(|e| PushError::KeyedArchiveError(format!("Failed to export P-224 private key: {}", e)))?;
+        assert_eq!(priv_bytes.len(), 28);
+
+        // Extract public key as uncompressed SEC1 (04 || x || y = 57 bytes)
+        let mut ctx = BigNumContext::new()?;
+        let pub_bytes = keypair.public_key()
+            .to_bytes(&group, openssl::ec::PointConversionForm::UNCOMPRESSED, &mut ctx)?;
+        assert_eq!(pub_bytes.len(), 57);
+
+        // Generate random 32-byte AES-256 shared secret
+        let shared_secret: [u8; 32] = rand::thread_rng().gen();
+
+        info!("[FMF-MAPPING]   Generated pubkey (first 8): {}", encode_hex(&pub_bytes[..8]));
+        info!("[FMF-MAPPING]   Generated shared_secret (first 8): {}", encode_hex(&shared_secret[..8]));
+
+        let priv_arr: [u8; 28] = priv_bytes.clone().try_into().unwrap();
+        let pub_arr: [u8; 57] = pub_bytes.clone().try_into().unwrap();
+
+        // Persist in state
+        self.secure_locations_private_key = Some(priv_bytes);
+        self.secure_locations_public_key = Some(pub_bytes);
+        self.secure_locations_shared_secret = Some(shared_secret.to_vec());
+
+        Ok((priv_arr, pub_arr, shared_secret))
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, PushError> {
@@ -226,6 +408,7 @@ const SEARCH_PARTY_CONTAINER: CloudKitContainer = CloudKitContainer {
 };
 
 use log::info;
+use log::error;
 use cloudkit_proto::{request_operation::header::IsolationLevel, CloudKitEncryptor, CloudKitRecord};
 use crate::cloudkit_proto::RecordIdentifier;
 
@@ -940,7 +1123,16 @@ impl<P: AnisetteProvider> FindMyClient<P> {
                 let item = SharedBeaconRecord::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
 
                 shared_beacons.insert(identifier, item);
-            } else { continue }
+            } else {
+                // Log unknown record types for discovery
+                let record_type_name = record.r#type.as_ref().map(|t| t.name().to_string()).unwrap_or_else(|| "<unknown>".to_string());
+                let field_names: Vec<String> = record.record_field.iter()
+                    .map(|f| f.identifier.as_ref().map(|id| id.name.clone().unwrap_or_default()).unwrap_or_default())
+                    .collect();
+                info!("[FMF-BEACONSTORE] Unknown record type: '{}', id='{}', fields={:?}", 
+                    record_type_name, identifier, field_names);
+                continue
+            }
         }
 
         for (id, record) in beacon_records {
@@ -1277,12 +1469,1533 @@ impl<P: AnisetteProvider> FindMyClient<P> {
         Ok(())
     }
 
+    /// Publish location via the modern secure-locations channel (People surface).
+    ///
+    /// This is the correct mechanism for appearing under "People" in friends' Find My.
+    /// Uses ECIES with P-224 + X9.63 KDF (SHA-256) + AES-128-GCM-KDFIV.
+    /// Submits to gateway.icloud.com/findmyservice/submit (same auth as AirTag submit).
+    ///
+    /// Algorithm: algid:encrypt:ECIES:ECDH:KDFX963:SHA256:AESGCM-KDFIV
+    /// Key ID: SHA256(public_key_x_coordinate)
+    /// Endpoint: POST /findmyservice/submit with searchPartyToken auth
+    ///
+    /// Crypto verified bidirectionally against `Security.framework`. See
+    /// `tools/findmy-capture/INVESTIGATION.md` §29-31.
+    pub async fn publish_secure_location(
+        &self,
+        latitude: f64,
+        longitude: f64,
+        altitude: f64,
+        horizontal_accuracy: f64,
+        vertical_accuracy: f64,
+        speed: f64,
+        course: f64,
+    ) -> Result<(), PushError> {
+        // NOTE: no forced token refresh here. searchPartyToken is valid ~1 week and
+        // `get_mme_token` (below) refreshes lazily when the cached token is missing/stale.
+        // The old unconditional `refresh_mme()` ran a full relay-backed GSA + MobileMe
+        // delegate-login on every publish, which intermittently failed
+        // (DelegateLoginFailed / UnauthorizedAccountError) for no benefit. We instead refresh
+        // REACTIVELY: only if the submit comes back 401 do we refresh once and retry (see the
+        // retry loop around the POST below). Matches the fetch_locations pattern.
+
+        // Log available tokens for diagnostics
+        {
+            let mme = self.token_provider.mme_delegate.lock().await;
+            if let Some(ref mme_resp) = *mme {
+                let token_names: Vec<&String> = mme_resp.tokens.keys().collect();
+                info!("[FMF-SECURE] Available MME tokens: {:?}", token_names);
+            } else {
+                info!("[FMF-SECURE] No MME delegate available at all");
+            }
+        }
+
+        let mut state = self.state.state.lock().await;
+
+        // Generate or retrieve persistent secure location keys.
+        // On first call, this creates a P-224 keypair + AES-256 shared secret.
+        // The key_id derivation (base64(SHA256(pubkey_x))) stays the same.
+        let (priv_key, pub_key, shared_secret) = state.get_or_generate_secure_location_keys()?;
+        // Save state if keys were just generated
+        self.state.save(&state)?;
+
+        let x_bytes = &pub_key[1..29]; // skip 0x04 prefix
+        let y_bytes = &pub_key[29..57];
+
+        // Key ID = base64(SHA256(x_coordinate))
+        let key_id = base64_encode(&sha256(x_bytes));
+
+        info!("[FMF-SECURE] Using generated publisher pubkey");
+        info!("[FMF-SECURE] Derived key_id: {}", key_id);
+        info!("[FMF-SECURE] Pubkey (first 8): {}", encode_hex(&pub_key[..8]));
+
+        let now_ms = duration_since_epoch().as_millis() as i64;
+        // Cocoa epoch = seconds since 2001-01-01 (NOT Unix epoch).
+        // Apple's plaintext uses this format; verified against captured publish.
+        let unix_secs = duration_since_epoch().as_secs_f64();
+        let cocoa_epoch_secs = unix_secs - 978307200.0;
+
+        // Build the JSON plaintext exactly as captured from a real iOS publish.
+        // Field order matches the capture in case Apple's parser is order-sensitive
+        // (untested, but cheap to match).
+        //
+        // findMyId is `base64(dsid_string)` with the standard `=` padding chars
+        // replaced by `~` — verified against the captured value:
+        //   captured: "MTgyNDMxMzE5MDY~"
+        //   decoded:  base64_decode("MTgyNDMxMzE5MDY=") == "18243131906"
+        // (The earlier inline comment claimed `base64url("dsid~")`, but that's
+        // wrong — the trailing `~` is base64 padding, not part of the input.)
+        let dsid_b64 = base64_encode(state.dsid.as_bytes());
+        let find_my_id = dsid_b64.replace('=', "~");
+        info!("[FMF-SECURE] findMyId derived from state.dsid: {} (was hardcoded MTgyNDMxMzE5MDY~)", find_my_id);
+
+        let plaintext_json = serde_json::to_string(&json!({
+            "speed": speed,
+            "locationLabel": serde_json::Value::Null,
+            "timestamp": cocoa_epoch_secs,
+            "longitude": longitude,
+            "motionActivityState": 0,
+            "latitude": latitude,
+            "verticalAccuracy": vertical_accuracy,
+            "publishReason": 4,           // 4 = bystander
+            "findMyId": find_my_id,
+            "course": course,
+            "floor": 0,
+            "altitude": altitude,
+            "horizontalAccuracy": horizontal_accuracy,
+        })).map_err(|e| PushError::KeyedArchiveError(format!("JSON serialize failed: {}", e)))?;
+
+        let plaintext = plaintext_json.as_bytes();
+
+        info!("[FMF-SECURE] Publishing: lat={}, lon={}, key_id={}, {} bytes plaintext (JSON, Cocoa epoch)",
+            latitude, longitude, key_id, plaintext.len());
+
+        // ECIES encrypt with the publisher's own public key (broadcast model)
+        let x_arr: [u8; 28] = x_bytes.try_into().map_err(|_| PushError::KeyedArchiveError("x not 28 bytes".to_string()))?;
+        let y_arr: [u8; 28] = y_bytes.try_into().map_err(|_| PushError::KeyedArchiveError("y not 28 bytes".to_string()))?;
+        let encrypted = Self::ecies_p224_encrypt(plaintext, &x_arr, &y_arr)?;
+        let encrypted_b64 = base64_encode(&encrypted);
+
+        info!("[FMF-SECURE] Encrypted blob: {} bytes (expected {} = 57 + {} + 16)",
+            encrypted.len(), 57 + plaintext.len() + 16, plaintext.len());
+
+        // Get APNs token for clientContext.
+        //
+        // For the first end-to-end test we hardcode the captured iPhone-6s
+        // (capture device) apsToken to keep all clientContext fields consistent
+        // with the captured submit. If Apple cross-validates apsToken against the
+        // searchPartyToken's account/DSID, mixing them would cause a 4xx; using
+        // the same one across the board avoids surfacing that variable until
+        // we've verified the crypto+protocol path end-to-end.
+        //
+        // (This is the 6s Frida-rig device's APNs token, NOT the iPhone 6
+        // validation-data relay's — the relay is account-less and doesn't have
+        // a relevant APNs identity here.)
+        //
+        // For production use, this needs to come from `self.conn.get_token()`
+        // (the live Android APNs token).
+        let aps_token = encode_hex(&self.conn.get_token().await).to_uppercase();
+        info!("[FMF-SECURE] Using device apsToken: {}...{}", &aps_token[..8], &aps_token[aps_token.len()-8..]);
+
+        // clientId: per the USER HYPOTHESIS + 6s diff, this should be a device identity Apple
+        // RECOGNIZES on the account. The Android isn't a registered device; the iPhone-6 RELAY is
+        // (it owns our GSAuth and appears in the account's Devices list). So use the RELAY's UDID,
+        // not a fabricated Android-derived value (my earlier sha1(android_uuid) was a value Apple has
+        // never seen) and not the stale 6s capture. Logged so we can see its exact format/value.
+        let client_id = self.config.get_udid().to_lowercase();
+        info!("[FMF-SECURE] clientId (relay device UDID via config.get_udid): {}", client_id);
+
+        info!("[FMF-SECURE] Using apsToken: {}...{}", &aps_token[..8], &aps_token[aps_token.len()-8..]);
+
+        // Build the request body
+        let request_body = json!({
+            "clientContext": {
+                "apsToken": aps_token,
+                "clientId": client_id,
+                "contextApp": "searchpartyd",
+                "autoMeStatus": 0,
+                "publishReason": "bystander",
+            },
+            "submit": [{
+                "id": key_id,
+                "locationInfo": [{
+                    "locationTs": now_ms,
+                    "location": encrypted_b64,
+                }]
+            }]
+        });
+
+        info!("[FMF-SECURE] Request body (truncated): {}", &serde_json::to_string(&request_body).unwrap_or_default()[..500.min(serde_json::to_string(&request_body).unwrap_or_default().len())]);
+
+        let body = serde_json::to_string(&request_body)?;
+        let submit_url = "https://gateway.icloud.com/findmyservice/submit";
+        info!("[FMF-SECURE] POST {} | dsid={} | key_id={} | unix_ms={}",
+            submit_url, state.dsid, key_id, now_ms);
+        //
+        // Send the submit, refreshing the token REACTIVELY only on a 401 (expired/invalid token).
+        // Attempt 0 uses the cached token; on 401 we force-refresh the MME delegate once and retry
+        // attempt 1 with the fresh token. Any other status (incl. the known 428 ACL) is handled by
+        // the status branch below — retrying those wouldn't help. Token + anisette headers are
+        // rebuilt each attempt so the retry actually carries the refreshed token. Body is cloned.
+        let (status, resp_headers, response_body) = {
+            let mut attempt = 0u8;
+            loop {
+                // Get searchPartyToken from MobileMe delegation (lazy; refreshed once on 401 below).
+                let search_party_token = self.token_provider.get_mme_token("searchPartyToken").await
+                    .map_err(|e| {
+                        error!("[FMF-SECURE] searchPartyToken not available from delegation: {:?}", e);
+                        e
+                    })?;
+                info!("[FMF-SECURE] Got searchPartyToken from delegation (attempt {})", attempt);
+
+                let mut request_headers: HeaderMap = self.anisette.lock().await.get_headers().await?.clone().into_iter()
+                    .map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect();
+                request_headers.remove("X-Mme-Client-Info");
+                let sent_header_names: Vec<String> = request_headers.keys().map(|k| k.as_str().to_string()).collect();
+                info!("[FMF-SECURE] Submit request anisette header names: {:?} (+ X-MMe-Client-Info, x-apple-setup-proxy-request, accept-version:4, user-agent, x-apple-i-device-type, Content-Type)", sent_header_names);
+
+                let description = REQWEST.post(submit_url)
+                    .basic_auth(&format!("{}", state.dsid), Some(&search_party_token))
+                    .headers(request_headers)
+                    .header("X-MMe-Client-Info", self.config.get_mme_clientinfo("com.apple.icloud.searchpartyuseragent/1.0"))
+                    .header("x-apple-setup-proxy-request", "true")
+                    .header("accept-version", "4")
+                    .header("user-agent", "searchpartyuseragent/1 iMac13,1/13.6.4")
+                    .header("x-apple-i-device-type", "1")
+                    .header("Content-Type", "application/json")
+                    .body(body.clone())
+                    .send().await?;
+
+                let status = description.status();
+                // Capture response headers before consuming body (response.text() consumes self).
+                let resp_headers: Vec<(String, String)> = description.headers().iter()
+                    .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("<non-utf8>").to_string()))
+                    .collect();
+                let response_body = description.text().await.unwrap_or_default();
+
+                // 401 on the first attempt → token likely expired; refresh once and retry.
+                if status.as_u16() == 401 && attempt == 0 {
+                    info!("[FMF-SECURE] Submit got 401 — refreshing MME token and retrying once");
+                    if let Err(e) = self.token_provider.refresh_mme().await {
+                        info!("[FMF-SECURE] MME refresh after 401 failed: {:?}", e);
+                        break (status, resp_headers, response_body);
+                    }
+                    attempt += 1;
+                    continue;
+                }
+
+                break (status, resp_headers, response_body);
+            }
+        };
+
+        info!("[FMF-SECURE] Submit HTTP status: {}", status);
+        // For 4xx/5xx, log full body (Apple sometimes returns larger messages
+        // than the 500-char window). For 2xx, keep the truncated form.
+        if status.is_client_error() || status.is_server_error() {
+            info!("[FMF-SECURE] Submit response body (full): {}", response_body);
+            info!("[FMF-SECURE] Submit response headers: {:?}", resp_headers);
+            // Propagate the failure so callers (and the [FMF-SUMMARY] line) reflect reality.
+            // Previously this returned Ok(()) on ANY status, which masked 428 ACL failures.
+            return Err(PushError::KeyedArchiveError(format!(
+                "publish submit rejected: HTTP {} body={}", status, response_body)));
+        } else {
+            info!("[FMF-SECURE] Submit response body: {}", &response_body[..response_body.len().min(500)]);
+        }
+        Ok(())
+    }
+
+    /// Fetch friends' secure locations from `findmyservice/fetch` and decrypt them
+    /// with the PER-FRIEND private keys they sent us via `secureLocationsKeyUpdate`.
+    ///
+    /// Proven via Ghidra + live capture (see SESSION_2026_06_12_RECEIVE_FINDINGS.md, incl. the
+    /// 2026-06-14 CORRECTION):
+    /// - When a friend shares their location with us, they send a T:10 secureLocationsKeyUpdate
+    ///   IDS message containing THEIR OWN private key (85B), their key_id (=SHA256(their pubkey_x)),
+    ///   and their findMyId (=base64(their DSID) = their Follow.id).
+    /// - We store that in state.friend_secure_keys keyed by their findMyId.
+    /// - To fetch their location: POST findmyservice/fetch with fmId=their Follow.id and
+    ///   ids=[their key_id], then ECIES-decrypt the returned blob with THEIR private key.
+    ///
+    /// `fm_ids` are the friends' Follow.id values to fetch. Returns map findMyId -> location JSON.
+    pub async fn fetch_locations(&self, fm_ids: &[String]) -> Result<HashMap<String, serde_json::Value>, PushError> {
+        info!("[FMF-FETCH] Fetching secure locations for {} friends", fm_ids.len());
+
+        if fm_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // NOTE: we deliberately do NOT force a token refresh here. searchPartyToken is valid
+        // for ~1 week, and `get_mme_token` (below) already refreshes lazily when the cached
+        // token is missing or older than a week. The previous unconditional `refresh_mme()`
+        // ran a full GSA + MobileMe delegate-login every 5s cycle through the relay's anisette
+        // identity, which intermittently failed (DelegateLoginFailed / UnauthorizedAccountError)
+        // and was the dominant FMF error source. We instead refresh REACTIVELY: only if the
+        // fetch comes back 401 do we refresh the token once and retry (see retry loop below).
+
+        // Gather the per-friend key material we've received. Build a fetch entry per friend
+        // that we hold a key for, keyed by THAT FRIEND's key_id.
+        // friend_keys: fmId(Follow.id) -> (key_id, private_key[28], public_key[57])
+        let (friend_keys, dsid) = {
+            let state = self.state.state.lock().await;
+            let mut map: HashMap<String, (String, [u8; 28], [u8; 57])> = HashMap::new();
+            for (find_my_id, keys) in state.friend_secure_keys.iter() {
+                // Only fetch for friends in the requested set.
+                if !fm_ids.iter().any(|f| f == find_my_id) {
+                    continue;
+                }
+                let priv_arr: [u8; 28] = match keys.private_key.clone().try_into() {
+                    Ok(a) => a,
+                    Err(_) => { info!("[FMF-FETCH]   skip {}: priv key not 28 bytes", find_my_id); continue; }
+                };
+                let pub_arr: [u8; 57] = match keys.public_key.clone().try_into() {
+                    Ok(a) => a,
+                    Err(_) => { info!("[FMF-FETCH]   skip {}: pub key not 57 bytes", find_my_id); continue; }
+                };
+                let key_id = base64_encode(&sha256(&pub_arr[1..29]));
+                map.insert(find_my_id.clone(), (key_id, priv_arr, pub_arr));
+            }
+            (map, state.dsid.clone())
+        };
+
+        info!("[FMF-FETCH] Have keys for {}/{} friends; subscribing (ids:[]) for the rest",
+            friend_keys.len(), fm_ids.len());
+
+        let aps_token = encode_hex(&self.conn.get_token().await).to_uppercase();
+        // Same clientId as publish_secure_location — the RELAY device UDID (recognized on the account),
+        // so submit + fetch present one consistent client identity. Was hardcoded 6s UDID / sha1 guess.
+        let client_id = self.config.get_udid().to_lowercase();
+
+        // Build a fetch entry for EVERY following friend — not only the ones we hold keys for.
+        //
+        // KEY INSIGHT (proven via Ghidra on searchpartyd, 2026-06-24): iOS SubscribeAndFetch
+        // registers a viewer by findMyId (FUN_1002a2654 gates on "findMyIds", not on a held key),
+        // and FUN_1001f1ae4 issues a fetch even with no key to "request new keys". The act of
+        // subscribing is what makes Apple push `distributeKeys` to the publisher, which causes the
+        // publisher to send us the T:10 secureLocationsKeyUpdate. Without ever subscribing we are
+        // never registered as a viewer, so no key is ever distributed to us -> blank map.
+        //
+        // The `ids` field on the fetch entry is a NON-optional Swift.Array (proven from the
+        // __swift5_fieldmd metadata of the fetch-entry struct), so the encoder always emits it:
+        // a keyless first subscribe sends "ids":[] (empty array), NOT an omitted field. Friends we
+        // already hold a key for send ids:[their key_id] so the response includes their location.
+        //
+        // THROTTLING: keyed friends are included EVERY cycle (we want their location refreshed at
+        // the loop's full cadence). Unkeyed friends only get a keyless "ids":[] subscribe at most
+        // once per FMF_SUBSCRIBE_MIN_INTERVAL_MS each (fmf_subscribe_should_fire gate) — the keyless
+        // subscribe is just the "please distribute a key to me" trigger, so re-sending it every few
+        // seconds is wasteful. Once their key arrives they move to the keyed (un-throttled) path.
+        let mut subscribe_skipped = 0usize;
+        let fetch_entries: Vec<serde_json::Value> = fm_ids.iter().filter_map(|fm_id| {
+            match friend_keys.get(fm_id) {
+                Some((key_id, _, _)) => Some(json!({
+                    "fmId": fm_id,
+                    "intent": "startLocationUpdates",
+                    "mode": "shallow",
+                    "ids": [key_id],
+                })),
+                None => {
+                    if fmf_subscribe_should_fire(fm_id) {
+                        Some(json!({
+                            "fmId": fm_id,
+                            "intent": "startLocationUpdates",
+                            "mode": "shallow",
+                            "ids": [],
+                        }))
+                    } else {
+                        subscribe_skipped += 1;
+                        None
+                    }
+                }
+            }
+        }).collect();
+
+        let request_body = json!({
+            "fetch": fetch_entries,
+            "clientContext": {
+                "apsToken": aps_token,
+                "clientId": client_id,
+                "contextApp": "com.apple.findmy.fmfcore",
+                "shallowStats": {},
+            }
+        });
+
+        let body = serde_json::to_string(&request_body)?;
+        let fetch_url = "https://gateway.icloud.com/findmyservice/fetch";
+        let subscribe_only = fetch_entries.len() - friend_keys.len();
+        info!("[FMF-FETCH] POST {} | dsid={} | {} entries ({} with key, {} subscribe-only ids:[], {} keyless throttled this cycle)",
+            fetch_url, dsid, fetch_entries.len(), friend_keys.len(), subscribe_only, subscribe_skipped);
+
+        // If every entry was throttled out (all friends unkeyed and within their subscribe
+        // window) there is nothing to ask Apple for this cycle — skip the round trip.
+        if fetch_entries.is_empty() {
+            info!("[FMF-FETCH] No fetch entries this cycle (all unkeyed friends throttled); skipping POST");
+            return Ok(HashMap::new());
+        }
+
+        // Send the fetch, refreshing the token REACTIVELY only on a 401. We try at most twice:
+        // attempt 0 uses the cached token; if Apple rejects it with 401 (expired/invalid), we
+        // force-refresh the MME delegate once and retry attempt 1 with the fresh token. Any other
+        // non-success status is a hard error (no point retrying). This replaces the old
+        // per-cycle unconditional refresh_mme().
+        let (status, response_body) = {
+            let mut attempt = 0u8;
+            loop {
+                // (Re)acquire the token each attempt — refresh_mme() on a 401 updates the cached
+                // value, so attempt 1 must read it again to pick up the fresh token.
+                let search_party_token = self.token_provider.get_mme_token("searchPartyToken").await
+                    .map_err(|e| {
+                        error!("[FMF-FETCH] searchPartyToken not available: {:?}", e);
+                        e
+                    })?;
+
+                let mut request_headers: HeaderMap = self.anisette.lock().await.get_headers().await?.clone().into_iter()
+                    .map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect();
+                request_headers.remove("X-Mme-Client-Info");
+
+                let response = REQWEST.post(fetch_url)
+                    .basic_auth(&format!("{}", dsid), Some(&search_party_token))
+                    .headers(request_headers)
+                    .header("X-MMe-Client-Info", self.config.get_mme_clientinfo("com.apple.icloud.searchpartyuseragent/1.0"))
+                    .header("x-apple-setup-proxy-request", "true")
+                    .header("accept-version", "4")
+                    .header("user-agent", "searchpartyuseragent/1 iMac13,1/13.6.4")
+                    .header("x-apple-i-device-type", "1")
+                    .header("Content-Type", "application/json")
+                    .body(body.clone())
+                    .send().await?;
+
+                let status = response.status();
+                let response_body = response.text().await.unwrap_or_default();
+                info!("[FMF-FETCH] HTTP status: {} (attempt {})", status, attempt);
+
+                // 401 on the first attempt → token likely expired; force one refresh and retry.
+                if status.as_u16() == 401 && attempt == 0 {
+                    info!("[FMF-FETCH] 401 — refreshing MME token and retrying once");
+                    if let Err(e) = self.token_provider.refresh_mme().await {
+                        info!("[FMF-FETCH] MME refresh after 401 failed: {:?}", e);
+                        // Nothing more we can do; surface the 401.
+                        break (status, response_body);
+                    }
+                    attempt += 1;
+                    continue;
+                }
+
+                break (status, response_body);
+            }
+        };
+
+        if !status.is_success() {
+            info!("[FMF-FETCH] Non-success body: {}", &response_body[..response_body.len().min(500)]);
+            return Err(PushError::KeyedArchiveError(format!("fetch failed: HTTP {}", status)));
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&response_body)
+            .map_err(|e| PushError::KeyedArchiveError(format!("fetch response parse failed: {}", e)))?;
+
+        let payloads = parsed.get("locationPayload")
+            .and_then(|p| p.as_array())
+            .cloned()
+            .unwrap_or_default();
+        info!("[FMF-FETCH] locationPayload entries: {}", payloads.len());
+
+        // Build a reverse lookup: key_id -> (fmId, priv, pub) so we can match each response
+        // entry (response `id` == the friend's key_id) to the right friend + decrypt key.
+        let by_key_id: HashMap<String, (String, [u8; 28], [u8; 57])> = friend_keys.iter()
+            .map(|(fm_id, (key_id, priv_arr, pub_arr))| (key_id.clone(), (fm_id.clone(), *priv_arr, *pub_arr)))
+            .collect();
+
+        let mut result = HashMap::new();
+
+        for entry in &payloads {
+            let id = entry.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let Some((fm_id, priv_arr, pub_arr)) = by_key_id.get(id) else {
+                info!("[FMF-FETCH]   response id {} matches no known friend key", id);
+                continue;
+            };
+            let loc_infos = entry.get("locationInfo").and_then(|v| v.as_array());
+            let Some(loc_infos) = loc_infos else { continue };
+
+            let best = loc_infos.iter().max_by_key(|li|
+                li.get("locationTs").and_then(|v| v.as_i64()).unwrap_or(0));
+            let Some(best) = best else { continue };
+
+            let Some(loc_b64) = best.get("location").and_then(|v| v.as_str()) else { continue };
+            let blob = base64_decode(loc_b64);
+            let blob_prefix = if blob.is_empty() { 0 } else { blob[0] };
+            info!("[FMF-FETCH]   friend fmId={} id={} blob={} bytes prefix={:#04x} (expect 0x04, len>=73)",
+                fm_id, id, blob.len(), blob_prefix);
+
+            match Self::ecies_p224_decrypt(&blob, priv_arr, pub_arr) {
+                Ok(plaintext) => {
+                    match serde_json::from_slice::<serde_json::Value>(&plaintext) {
+                        Ok(loc_json) => {
+                            info!("[FMF-FETCH]   DECRYPT OK for {}: {}", fm_id,
+                                &serde_json::to_string(&loc_json).unwrap_or_default()[..200.min(serde_json::to_string(&loc_json).unwrap_or_default().len())]);
+                            result.insert(fm_id.clone(), loc_json);
+                        },
+                        Err(e) => info!("[FMF-FETCH]   plaintext not JSON: {:?} (len {}, first bytes {})",
+                            e, plaintext.len(), encode_hex(&plaintext[..plaintext.len().min(16)])),
+                    }
+                },
+                // decrypt failure here almost always means key mismatch (our stored friend key
+                // doesn't match the key the location was encrypted to) vs a malformed blob
+                // (bad prefix / too short, visible in the line above).
+                Err(e) => info!("[FMF-FETCH]   decrypt FAILED for fmId={} (likely key mismatch): {:?}", fm_id, e),
+            }
+        }
+
+        info!("[FMF-FETCH] Decrypted {} friend locations", result.len());
+        Ok(result)
+    }
+
+    /// Low-level POST to /findmyservice/fetch with the standard anisette headers.
+    /// Returns (status_code_string, response_body). Used by verify_published_location's
+    /// two-phase self-subscribe test so phase 1 (keyless) and phase 2 (keyed) share one path.
+    async fn post_findmy_fetch(&self, body: &serde_json::Value, dsid: &str) -> Result<(String, String), PushError> {
+        let search_party_token = self.token_provider.get_mme_token("searchPartyToken").await?;
+        let mut request_headers: HeaderMap = self.anisette.lock().await.get_headers().await?.clone().into_iter()
+            .map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect();
+        request_headers.remove("X-Mme-Client-Info");
+        let body_str = serde_json::to_string(body)?;
+        let response = REQWEST.post("https://gateway.icloud.com/findmyservice/fetch")
+            .basic_auth(&format!("{}", dsid), Some(&search_party_token))
+            .headers(request_headers)
+            .header("X-MMe-Client-Info", self.config.get_mme_clientinfo("com.apple.icloud.searchpartyuseragent/1.0"))
+            .header("x-apple-setup-proxy-request", "true")
+            .header("accept-version", "4")
+            .header("user-agent", "searchpartyuseragent/1 iMac13,1/13.6.4")
+            .header("x-apple-i-device-type", "1")
+            .header("Content-Type", "application/json")
+            .body(body_str)
+            .send().await?;
+        let status = response.status().to_string();
+        let resp_body = response.text().await.unwrap_or_default();
+        Ok((status, resp_body))
+    }
+
+    /// END-TO-END SELF-VERIFICATION: self-SUBSCRIBE then fetch our OWN published blob and decrypt it.
+    ///
+    /// ⚠️ EXPERIMENTAL (2026-06-25): earlier self-fetch returned empty, and a 6s probe showed iOS
+    /// never self-fetches — so we concluded self-verification was impossible. BUT that self-fetch
+    /// skipped PHASE 1: the receive flow is two-phase (keyless subscribe ids:[] REGISTERS a viewer,
+    /// THEN keyed fetch ids:[key_id] returns the blob). This version now does a keyless self-subscribe
+    /// to our OWN findMyId first, waits, then keyed-fetches. If the server honors a self-subscribe,
+    /// it returns our own blob -> full LOCAL proof with no friend. If phase 2 is still empty after a
+    /// successful phase-1 subscribe, self-verification really is impossible and only a friend can test.
+    ///
+    /// Why: an HTTP 200 on `/findmyservice/submit` proves ONLY that Apple accepted+stored
+    /// the blob. It does NOT prove the chain a friend depends on:
+    ///   stored under a fetchable key_id -> retrievable via /fetch -> decryptable.
+    /// We publish encrypted to our OWN P-224 pubkey and hold the matching private key, so
+    /// we can fetch our own key_id and decrypt it ourselves — no friend/human needed.
+    ///
+    /// A round-trip back to the coords we published (e.g. Montreal 45.5017, -73.5673)
+    /// PROVES: blob stored + fetchable-under-key_id + decryptable-with-our-key. It does NOT
+    /// prove a friend received the T:10 key-update; that remains a separate dispatch fact.
+    ///
+    /// Returns the decrypted location JSON on success.
+    pub async fn verify_published_location(&self) -> Result<serde_json::Value, PushError> {
+        info!("[FMF-SELFTEST] === self-fetch verification START ===");
+
+        // NOTE: no forced token refresh here. post_findmy_fetch (used for both phases below)
+        // acquires the token via get_mme_token, which lazily refreshes only when the cached
+        // token is missing or >1 week old. The old unconditional refresh_mme() was a copy of the
+        // fetch_locations pattern (since removed) — it ran a full relay-backed delegate login that
+        // intermittently failed (UnauthorizedAccountError) for no benefit, so it's gone here too.
+
+        // Load OUR persistent keypair — the SAME one publish_secure_location encrypts to.
+        // Must NOT depend on friend_secure_keys (that's the receive path).
+        let (our_priv, our_pub, _shared, our_key_id, find_my_id, dsid) = {
+            let mut state = self.state.state.lock().await;
+            let (priv_key, pub_key, shared) = state.get_or_generate_secure_location_keys()?;
+            self.state.save(&state)?;
+            // key_id = base64(SHA256(pubkey_x)), x = pub_key[1..29] (skip 0x04 prefix).
+            let key_id = base64_encode(&sha256(&pub_key[1..29]));
+            // findMyId = base64(dsid).replace('=','~') == our Follow.id (matches publish).
+            let fm_id = base64_encode(state.dsid.as_bytes()).replace('=', "~");
+            (priv_key, pub_key, shared, key_id, fm_id, state.dsid.clone())
+        };
+
+        info!("[FMF-SELFTEST] our key_id={} | findMyId={} | dsid={}", our_key_id, find_my_id, dsid);
+
+        let aps_token = encode_hex(&self.conn.get_token().await).to_uppercase();
+        let client_id = self.config.get_udid().to_lowercase();
+
+        // === PHASE 1: keyless SELF-SUBSCRIBE to our OWN findMyId (ids:[]). ===
+        // The receive agent proved the real fetch flow is two-phase: a keyless subscribe (ids:[])
+        // REGISTERS us as a viewer of an fmId, THEN a keyed fetch (ids:[key_id]) returns the blob.
+        // Our earlier self-fetch skipped phase 1 and went straight to the keyed fetch — which is why
+        // it returned empty (we were never registered as a subscriber to our own key_id). Here we
+        // first subscribe to OURSELVES, give the server a moment, then keyed-fetch. If the server
+        // treats a self-subscribe like any other, it will serve our own blob back -> full local proof.
+        // If it refuses self-subscription, phase 2 stays empty and self-verification is truly impossible.
+        let subscribe_body = json!({
+            "fetch": [{
+                "fmId": find_my_id,
+                "intent": "startLocationUpdates",
+                "mode": "shallow",
+                "ids": [],
+            }],
+            "clientContext": {
+                "apsToken": aps_token,
+                "clientId": client_id,
+                "contextApp": "com.apple.findmy.fmfcore",
+                "shallowStats": {},
+            }
+        });
+        match self.post_findmy_fetch(&subscribe_body, &dsid).await {
+            Ok((st, body)) => info!("[FMF-SELFTEST] PHASE1 keyless self-subscribe -> HTTP {} body={}",
+                st, &body[..body.len().min(300)]),
+            Err(e) => info!("[FMF-SELFTEST] PHASE1 keyless self-subscribe FAILED: {:?}", e),
+        }
+        // Give the server a moment, then begin polling.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        // === PHASE 2: keyed fetch of OUR key_id, RETRIED over several minutes. ===
+        // The receive path measured ~2 MINUTES between a keyless subscribe and keys/data arriving
+        // (server: subscribe -> distributeKeys -> publisher-send -> fan-out). A single 3s-delayed
+        // fetch (our earlier mistake) is far too short to conclude anything. So we poll the keyed
+        // fetch for up to ~5 min, re-subscribing every other cycle, and only declare "impossible"
+        // if it's STILL empty after the full window.
+        let keyed_body = json!({
+            "fetch": [{
+                "fmId": find_my_id,
+                "intent": "startLocationUpdates",
+                "mode": "shallow",
+                "ids": [our_key_id],
+            }],
+            "clientContext": {
+                "apsToken": aps_token,
+                "clientId": client_id,
+                "contextApp": "com.apple.findmy.fmfcore",
+                "shallowStats": {},
+            }
+        });
+
+        const MAX_ATTEMPTS: usize = 15;       // ~15 * 20s = 5 min
+        const POLL_INTERVAL_SECS: u64 = 20;
+        let mut last_raw = String::new();
+        for attempt in 1..=MAX_ATTEMPTS {
+            // Re-issue the keyless subscribe every 3rd attempt in case the first didn't stick.
+            if attempt > 1 && attempt % 3 == 1 {
+                match self.post_findmy_fetch(&subscribe_body, &dsid).await {
+                    Ok((st, _)) => info!("[FMF-SELFTEST] re-subscribe (attempt {}) -> HTTP {}", attempt, st),
+                    Err(e) => info!("[FMF-SELFTEST] re-subscribe (attempt {}) failed: {:?}", attempt, e),
+                }
+            }
+
+            let (status, response_body) = match self.post_findmy_fetch(&keyed_body, &dsid).await {
+                Ok(v) => v,
+                Err(e) => {
+                    info!("[FMF-SELFTEST] attempt {}/{} keyed fetch error: {:?}", attempt, MAX_ATTEMPTS, e);
+                    tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+                    continue;
+                }
+            };
+            last_raw = response_body.clone();
+            if !status.starts_with("200") {
+                info!("[FMF-SELFTEST] attempt {}/{} HTTP {} body={}", attempt, MAX_ATTEMPTS, status,
+                    &response_body[..response_body.len().min(300)]);
+                tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+                continue;
+            }
+
+            let parsed: serde_json::Value = serde_json::from_str(&response_body)
+                .map_err(|e| PushError::KeyedArchiveError(format!("self-fetch response parse failed: {}", e)))?;
+            let payloads = parsed.get("locationPayload").and_then(|p| p.as_array()).cloned().unwrap_or_default();
+            info!("[FMF-SELFTEST] attempt {}/{}: locationPayload entries: {}", attempt, MAX_ATTEMPTS, payloads.len());
+
+            if payloads.is_empty() {
+                // Still nothing this cycle — wait and retry (this is the EXPECTED early-cycle state
+                // given the ~2min server latency; NOT yet a failure).
+                tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+                continue;
+            }
+
+            // We got payload(s) — try to match + decrypt our key_id.
+            for entry in &payloads {
+                let id = entry.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                if id != our_key_id {
+                    info!("[FMF-SELFTEST]   response id {} != our key_id, skipping", id);
+                    continue;
+                }
+                let Some(loc_infos) = entry.get("locationInfo").and_then(|v| v.as_array()) else { continue };
+                let best = loc_infos.iter().max_by_key(|li|
+                    li.get("locationTs").and_then(|v| v.as_i64()).unwrap_or(0));
+                let Some(best) = best else { continue };
+                let Some(loc_b64) = best.get("location").and_then(|v| v.as_str()) else { continue };
+                let blob = base64_decode(loc_b64);
+                let blob_prefix = if blob.is_empty() { 0 } else { blob[0] };
+                info!("[FMF-SELFTEST]   blob={} bytes prefix={:#04x} (expect 0x04, len>=73)", blob.len(), blob_prefix);
+
+                match Self::ecies_p224_decrypt(&blob, &our_priv, &our_pub) {
+                    Ok(plaintext) => match serde_json::from_slice::<serde_json::Value>(&plaintext) {
+                        Ok(loc_json) => {
+                            let lat = loc_json.get("latitude").and_then(|v| v.as_f64());
+                            let lon = loc_json.get("longitude").and_then(|v| v.as_f64());
+                            info!("[FMF-SELFTEST] DECRYPT OK (attempt {}) — lat={:?} lon={:?} | full={}",
+                                attempt, lat, lon, serde_json::to_string(&loc_json).unwrap_or_default());
+                            info!("[FMF-SELFTEST] === SELF-FETCH VERIFIED: stored + fetchable + decryptable ===");
+                            return Ok(loc_json);
+                        },
+                        Err(e) => return Err(PushError::KeyedArchiveError(
+                            format!("self-fetch decrypt plaintext not JSON: {} (first bytes {})",
+                                e, encode_hex(&plaintext[..plaintext.len().min(16)])))),
+                    },
+                    Err(e) => return Err(PushError::KeyedArchiveError(
+                        format!("self-fetch decrypt FAILED (our own key should always work — blob/key bug?): {:?}", e))),
+                }
+            }
+
+            // Payload present but none matched our key_id — log and keep polling.
+            let returned_ids: Vec<String> = payloads.iter()
+                .filter_map(|e| e.get("id").and_then(|v| v.as_str()).map(|s| s.to_string())).collect();
+            info!("[FMF-SELFTEST] attempt {}: payload present but no match; expected key_id={} got ids={:?}",
+                attempt, our_key_id, returned_ids);
+            tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+        }
+
+        // Exhausted the full ~5min window with no payload for our key_id. NOW this is a meaningful
+        // negative: even with repeated subscribes over minutes, the server never served us our own
+        // blob. This is the proper basis for the "publisher cannot self-fetch" conclusion.
+        info!("[FMF-SELFTEST] EXHAUSTED {} attempts over ~{}s — no self-payload. last_raw={}",
+            MAX_ATTEMPTS, MAX_ATTEMPTS as u64 * POLL_INTERVAL_SECS, &last_raw[..last_raw.len().min(400)]);
+        Err(PushError::KeyedArchiveError(format!(
+            "self-fetch empty after {} attempts over ~5min — self-verification not possible (or blob not stored)",
+            MAX_ATTEMPTS)))
+    }
+
+    /// ECIES encrypt using P-224 + ANSI X9.63 KDF (SHA-256) + **AES-128**-GCM-KDFIV.
+    ///
+    /// This is Apple's `algid:encrypt:ECIES:ECDH:KDFX963:SHA256:AESGCM-KDFIV`,
+    /// also known as `kSecKeyAlgorithmECIESEncryptionStandardVariableIVX963SHA256AESGCM`.
+    ///
+    /// Key facts (verified bidirectionally against `Security.framework`, see
+    /// `tools/findmy-capture/INVESTIGATION.md` §29-31):
+    /// - KDF output is **32 bytes** total: AES-128 key (16) || GCM IV (16)
+    /// - Cipher is **AES-128**, NOT AES-256 (the "VariableIV" / KDFIV flavor)
+    /// - X9.63 KDF with single SHA-256 block (counter=1), shared_info = ephemeral pub
+    ///
+    /// Returns: 0x04 || ephemeral_pub_x(28) || ephemeral_pub_y(28) || ciphertext || tag(16)
+    fn ecies_p224_encrypt(plaintext: &[u8], pub_x: &[u8; 28], pub_y: &[u8; 28]) -> Result<Vec<u8>, PushError> {
+        let group = EcGroup::from_curve_name(Nid::SECP224R1)?;
+        let mut ctx = BigNumContext::new()?;
+
+        // Reconstruct public key from x, y coordinates
+        let pub_point = {
+            let x = BigNum::from_slice(pub_x)?;
+            let y = BigNum::from_slice(pub_y)?;
+            let mut point = EcPoint::new(&group)?;
+            point.set_affine_coordinates_gfp(&group, &x, &y, &mut ctx)?;
+            point
+        };
+        let target_ec = EcKey::from_public_key(&group, &pub_point)?;
+        let target_pkey = PKey::from_ec_key(target_ec)?;
+
+        // Generate ephemeral P-224 keypair
+        let ephemeral = EcKey::generate(&group)?;
+        let ephemeral_pub_bytes = ephemeral.public_key()
+            .to_bytes(&group, openssl::ec::PointConversionForm::UNCOMPRESSED, &mut ctx)?;
+        let ephemeral_pkey = PKey::from_ec_key(ephemeral)?;
+
+        // ECDH: derive shared secret (28 bytes for P-224)
+        let mut deriver = openssl::derive::Deriver::new(&ephemeral_pkey)?;
+        deriver.set_peer(&target_pkey)?;
+        let shared_secret = deriver.derive_to_vec()?;
+
+        // X9.63 KDF with SHA-256, shared_info = ephemeral public key bytes (uncompressed).
+        // dk_len=32 fits in one SHA-256 block; produces aes_key(16) || gcm_iv(16).
+        let kdf_block = sha256(&[
+            &shared_secret[..],
+            &[0x00, 0x00, 0x00, 0x01],
+            &ephemeral_pub_bytes[..],
+        ].concat());
+
+        let aes_key: &[u8; 16] = (&kdf_block[..16]).try_into().expect("16 bytes");
+        let gcm_iv: &[u8; 16] = (&kdf_block[16..32]).try_into().expect("16 bytes");
+
+        // AES-128-GCM with 16-byte IV (Apple's KDFIV variant uses non-standard IV size)
+        use aes_gcm::aead::generic_array::GenericArray;
+        let cipher: AesGcm<Aes128, U16> = AesGcm::new(GenericArray::from_slice(aes_key));
+        let nonce = GenericArray::from_slice(gcm_iv);
+        let encrypted = cipher.encrypt(nonce, plaintext)
+            .map_err(|_| PushError::KeyedArchiveError("AES-128-GCM encryption failed".to_string()))?;
+
+        // Wire format: ephemeral_pub_uncompressed(57) || ciphertext || tag(16)
+        let result = [&ephemeral_pub_bytes[..], &encrypted[..]].concat();
+
+        Ok(result)
+    }
+
+    /// Decrypt a friend's secure-location blob with OUR P-224 private key.
+    ///
+    /// This is the exact inverse of `ecies_p224_encrypt`. The blob fetched from
+    /// `findmyservice/fetch` has the form:
+    ///
+    /// ```text
+    /// 0x04 || eph_pub_x(28) || eph_pub_y(28) || ciphertext || tag(16)   (>= 57 + 16 bytes)
+    /// ```
+    ///
+    /// algid:encrypt:ECIES:ECDH:KDFX963:SHA256:AESGCM-KDFIV
+    ///   - ECDH(our_priv, eph_pub) -> shared secret (28 bytes for P-224)
+    ///   - X9.63 KDF (SHA-256, counter=1, shared_info = eph_pub uncompressed) -> 32 bytes
+    ///   - split into aes_key(16) || gcm_iv(16)
+    ///   - AES-128-GCM with 16-byte IV
+    ///
+    /// `our_private_key` is the 28-byte private scalar; `our_public_key` is the
+    /// 57-byte uncompressed pubkey (used to reconstruct the EC key for ECDH).
+    fn ecies_p224_decrypt(
+        blob: &[u8],
+        our_private_key: &[u8; 28],
+        our_public_key: &[u8; 57],
+    ) -> Result<Vec<u8>, PushError> {
+        if blob.len() < 57 + 16 {
+            return Err(PushError::KeyedArchiveError(format!(
+                "ECIES blob too short: {} bytes (need >= 73)", blob.len())));
+        }
+
+        let group = EcGroup::from_curve_name(Nid::SECP224R1)?;
+        let mut ctx = BigNumContext::new()?;
+
+        // Parse the ephemeral public key (first 57 bytes, uncompressed SEC1).
+        let eph_pub_bytes = &blob[..57];
+        if eph_pub_bytes[0] != 0x04 {
+            return Err(PushError::KeyedArchiveError(format!(
+                "ECIES ephemeral pubkey bad prefix: {:#04x}", eph_pub_bytes[0])));
+        }
+        let eph_point = EcPoint::from_bytes(&group, eph_pub_bytes, &mut ctx)?;
+        let eph_ec = EcKey::from_public_key(&group, &eph_point)?;
+        let eph_pkey = PKey::from_ec_key(eph_ec)?;
+
+        // Reconstruct OUR private key for ECDH.
+        let priv_bn = BigNum::from_slice(our_private_key)?;
+        let our_point = {
+            let x = BigNum::from_slice(&our_public_key[1..29])?;
+            let y = BigNum::from_slice(&our_public_key[29..57])?;
+            let mut point = EcPoint::new(&group)?;
+            point.set_affine_coordinates_gfp(&group, &x, &y, &mut ctx)?;
+            point
+        };
+        let our_ec = EcKey::from_private_components(&group, &priv_bn, &our_point)?;
+        our_ec.check_key()?;
+        let our_pkey = PKey::from_ec_key(our_ec)?;
+
+        // ECDH: shared secret (28 bytes for P-224).
+        let mut deriver = openssl::derive::Deriver::new(&our_pkey)?;
+        deriver.set_peer(&eph_pkey)?;
+        let shared_secret = deriver.derive_to_vec()?;
+
+        // X9.63 KDF (SHA-256, counter=1, shared_info = ephemeral pubkey uncompressed).
+        let kdf_block = sha256(&[
+            &shared_secret[..],
+            &[0x00, 0x00, 0x00, 0x01],
+            &eph_pub_bytes[..],
+        ].concat());
+
+        let aes_key: &[u8; 16] = (&kdf_block[..16]).try_into().expect("16 bytes");
+        let gcm_iv: &[u8; 16] = (&kdf_block[16..32]).try_into().expect("16 bytes");
+
+        // AES-128-GCM with 16-byte IV. ciphertext+tag is everything after the eph pubkey.
+        use aes_gcm::aead::generic_array::GenericArray;
+        let cipher: AesGcm<Aes128, U16> = AesGcm::new(GenericArray::from_slice(aes_key));
+        let nonce = GenericArray::from_slice(gcm_iv);
+        let ct_and_tag = &blob[57..];
+        let plaintext = cipher.decrypt(nonce, ct_and_tag)
+            .map_err(|_| PushError::KeyedArchiveError("AES-128-GCM decryption failed (wrong key?)".to_string()))?;
+
+        Ok(plaintext)
+    }
+
+    /// Decrypt an inbound v1 MappingPacket `p` blob from a friend.
+    ///
+    /// The `p` blob format: version(1) + nonce(16) + AES-256-GCM(plaintext_123, per_friend_key) + tag(16) = 156 bytes
+    /// The plaintext contains: header(6) + friend_private_key(28) + friend_public_key(57) + shared_secret(32)
+    /// The per_friend_key = SHA256(ECDH(friend_priv, OUR_pub)) = SHA256(ECDH(OUR_priv, friend_pub))
+    ///
+    /// But we have a bootstrap problem: we need the friend's pubkey to derive the per_friend_key,
+    /// and the friend's pubkey is inside the encrypted blob. However, since we proved Apple doesn't
+    /// validate the crypto, the friend likely encrypted with ECDH(their_priv, OUR_pub). We can
+    /// derive the same key using ECDH(OUR_priv, their_pub) — but we don't have their pub yet.
+    ///
+    /// Workaround: try decryption with our own ECDH(priv, pub) first (degenerate case — friend
+    /// might have used our pubkey as placeholder too), then if that fails, log the failure and
+    /// store the raw blob for later when we learn the friend's pubkey.
+    ///
+    /// Returns Ok(FriendSecureLocationKeys) if decrypt succeeds, Err otherwise.
+    fn decrypt_inbound_mapping_packet(
+        our_private_key: &[u8; 28],
+        our_public_key: &[u8; 57],
+        p_encoded: &str,
+    ) -> Result<FriendSecureLocationKeys, PushError> {
+        info!("[FMF-MAPPING-DECRYPT] Attempting to decrypt inbound MappingPacket");
+        info!("[FMF-MAPPING-DECRYPT]   p string length: {}, starts with: {}", p_encoded.len(), &p_encoded[..20.min(p_encoded.len())]);
+
+        // Decode: strip leading /, replace ~ with /, base64 decode
+        if !p_encoded.starts_with('/') {
+            return Err(PushError::KeyedArchiveError("p blob doesn't start with /".to_string()));
+        }
+        let b64 = p_encoded[1..].replace('~', "/");
+        let p_blob = base64_decode(&b64);
+        info!("[FMF-MAPPING-DECRYPT]   decoded blob: {} bytes", p_blob.len());
+
+        if p_blob.len() != 156 {
+            return Err(PushError::KeyedArchiveError(format!("p blob wrong size: {} (expected 156)", p_blob.len())));
+        }
+
+        // Parse structure: version(1) + nonce(16) + ciphertext(123) + tag(16)
+        let version = p_blob[0];
+        if version != 0x01 {
+            info!("[FMF-MAPPING-DECRYPT]   WARNING: unexpected version byte: {:#04x}", version);
+        }
+        let nonce_bytes = &p_blob[1..17];
+        let encrypted = &p_blob[17..]; // 139 bytes (123 ct + 16 tag)
+        info!("[FMF-MAPPING-DECRYPT]   version={:#04x}, nonce={}, encrypted={} bytes",
+            version, encode_hex(nonce_bytes), encrypted.len());
+
+        // Derive per-friend key: ECDH(our_priv, friend_pub)
+        // Since we don't know the friend's pub yet, try with our own pub (degenerate ECDH).
+        // If the friend used ECDH(their_priv, our_pub) to encrypt, and we try
+        // ECDH(our_priv, our_pub), this WON'T match unless the friend IS us.
+        // But if a real friend sent this, we need their pubkey from somewhere else.
+        //
+        // Strategy: try ECDH(our_priv, our_pub) first. If it fails (expected for real friends),
+        // we can't decrypt yet. Log everything and return an error.
+        // When we learn the friend's pubkey (from another source), we can retry.
+
+        let group = EcGroup::from_curve_name(Nid::SECP224R1)?;
+        let mut ctx = BigNumContext::new()?;
+
+        // Reconstruct our private key
+        let priv_bn = BigNum::from_slice(our_private_key)?;
+        let pub_point = {
+            let x = BigNum::from_slice(&our_public_key[1..29])?;
+            let y = BigNum::from_slice(&our_public_key[29..57])?;
+            let mut point = EcPoint::new(&group)?;
+            point.set_affine_coordinates_gfp(&group, &x, &y, &mut ctx)?;
+            point
+        };
+        let our_ec = EcKey::from_private_components(&group, &priv_bn, &pub_point)?;
+        let our_pkey = PKey::from_ec_key(our_ec)?;
+
+        // For now, try ECDH with our own pubkey (self-ECDH)
+        // This will only work if the sender used our pubkey as the friend_pub parameter
+        let friend_pkey = PKey::from_ec_key(EcKey::from_public_key(&group, &pub_point)?)?;
+
+        let mut deriver = openssl::derive::Deriver::new(&our_pkey)?;
+        deriver.set_peer(&friend_pkey)?;
+        let ecdh_shared = deriver.derive_to_vec()?;
+        let per_friend_key = sha256(&ecdh_shared);
+        info!("[FMF-MAPPING-DECRYPT]   per_friend_key (self-ECDH, first 8): {}", encode_hex(&per_friend_key[..8]));
+
+        // Try AES-256-GCM decrypt
+        use aes_gcm::aead::generic_array::GenericArray;
+        let cipher: AesGcm<Aes256, U16> = AesGcm::new(GenericArray::from_slice(&per_friend_key));
+        let nonce = GenericArray::from_slice(nonce_bytes);
+
+        match cipher.decrypt(nonce, encrypted) {
+            Ok(plaintext) => {
+                info!("[FMF-MAPPING-DECRYPT]   Decrypt SUCCESS! Plaintext: {} bytes", plaintext.len());
+                if plaintext.len() != 123 {
+                    info!("[FMF-MAPPING-DECRYPT]   WARNING: expected 123 bytes, got {}", plaintext.len());
+                }
+
+                // Parse plaintext: header(6) + private_key(28) + public_key(57) + shared_secret(32)
+                if plaintext.len() >= 123 {
+                    let header = &plaintext[0..6];
+                    let friend_priv = &plaintext[6..34];
+                    let friend_pub = &plaintext[34..91];
+                    let friend_secret = &plaintext[91..123];
+
+                    info!("[FMF-MAPPING-DECRYPT]   header: {}", encode_hex(header));
+                    info!("[FMF-MAPPING-DECRYPT]   friend private_key (first 8): {}", encode_hex(&friend_priv[..8]));
+                    info!("[FMF-MAPPING-DECRYPT]   friend public_key (first 8): {}", encode_hex(&friend_pub[..8]));
+                    info!("[FMF-MAPPING-DECRYPT]   friend shared_secret (first 8): {}", encode_hex(&friend_secret[..8]));
+
+                    // Validate the pubkey starts with 0x04 (uncompressed SEC1)
+                    if friend_pub[0] != 0x04 {
+                        info!("[FMF-MAPPING-DECRYPT]   WARNING: friend pubkey doesn't start with 0x04!");
+                    }
+
+                    Ok(FriendSecureLocationKeys {
+                        private_key: friend_priv.to_vec(),
+                        public_key: friend_pub.to_vec(),
+                        shared_secret: friend_secret.to_vec(),
+                        find_my_id: String::new(),
+                    })
+                } else {
+                    Err(PushError::KeyedArchiveError(format!("Decrypted plaintext too short: {} bytes", plaintext.len())))
+                }
+            },
+            Err(e) => {
+                info!("[FMF-MAPPING-DECRYPT]   Decrypt FAILED (expected if real friend — need their pubkey): {:?}", e);
+                info!("[FMF-MAPPING-DECRYPT]   Raw blob hex (for later retry): {}", encode_hex(&p_blob));
+                Err(PushError::KeyedArchiveError("AES-256-GCM decrypt failed — friend's pubkey unknown".to_string()))
+            }
+        }
+    }
+
+    /// Relay a server-provided mapping packet token to a friend via IDS.
+    /// The token (p blob) was already constructed by Apple's server via offerLocation.
+    /// We just wrap it in the IDS message format and send it.
+    ///
+    /// Parameters:
+    /// - `friend_handle`: The friend's IDS URI (e.g. "tel:+1234567890" or "mailto:friend@example.com")
+    /// - `p_token`: The pre-built p blob string from Apple's requestTokens response
+    pub async fn relay_mapping_packet(
+        &self,
+        friend_handle: &str,
+        p_token: &str,
+    ) -> Result<(), PushError> {
+        info!("[FMF-RELAY] Relaying mapping packet to: {} ({} chars)", friend_handle, p_token.len());
+
+        // Build the IDS payload as a binary plist:
+        // { kFMFServicePayloadKey: "mappingPacket", p: <token_string>, v: 1 }
+        let payload = plist::Dictionary::from_iter([
+            ("kFMFServicePayloadKey".to_string(), Value::String("mappingPacket".to_string())),
+            ("p".to_string(), Value::String(p_token.to_string())),
+            ("v".to_string(), Value::String("1".to_string())),
+        ]);
+        let payload_bytes = plist_to_bin(&payload)?;
+
+        // Normalize handle to IDS URI format
+        let uri_handle = if friend_handle.starts_with("tel:") || friend_handle.starts_with("mailto:") {
+            friend_handle.to_string()
+        } else if friend_handle.contains('@') {
+            format!("mailto:{}", friend_handle)
+        } else {
+            format!("tel:{}", friend_handle)
+        };
+
+        // Send on fmf topic
+        let topic = "com.apple.private.alloy.fmf";
+        let handle = self.identity.get_handles().await.remove(0);
+
+        match self.identity.cache_keys(
+            topic,
+            &[uri_handle.clone()],
+            &handle,
+            false,
+            &QueryOptions { required_for_message: true, result_expected: true },
+        ).await {
+            Ok(()) => {},
+            Err(e) => {
+                info!("[FMF-RELAY]   cache_keys failed: {:?}", e);
+                return Err(e);
+            }
+        }
+
+        let targets = self.identity.cache.lock().await
+            .get_participants_targets(topic, &handle, &[uri_handle.clone()]);
+
+        if targets.is_empty() {
+            info!("[FMF-RELAY]   No targets for {}", uri_handle);
+            return Ok(());
+        }
+
+        match self.identity.send_message(topic, IDSSendMessage {
+            sender: handle.clone(),
+            raw: Raw::Body(payload_bytes),
+            send_delivered: false,
+            command: 242,
+            no_response: true,
+            id: Uuid::new_v4().to_string().to_uppercase(),
+            scheduled_ms: None,
+            queue_id: None,
+            relay: None,
+            extras: Dictionary::from_iter([
+                ("wA".to_string(), Value::Boolean(true))
+            ]),
+        }, targets).await {
+            Ok(_) => info!("[FMF-RELAY] Sent to {}", uri_handle),
+            Err(e) => info!("[FMF-RELAY]   send failed: {:?}", e),
+        }
+
+        Ok(())
+    }
+
+    /// Distribute OUR P-224 private key to a follower via a `secureLocationsKeyUpdate` (T:10) IDS
+    /// message, so the follower can decrypt the location we publish to /findmyservice/submit.
+    ///
+    /// This is the MISSING publish step: without it, our submit (encrypted to our own pubkey) is
+    /// undecryptable by friends. Proven via Frida captures (see SESSION_2026_06_12_RECEIVE_FINDINGS.md):
+    /// the publisher hands each follower its OWN private key in this message.
+    ///
+    /// Wire format (mirror of `handle_secure_locations_key_update`, byte-validated from capture):
+    ///   outer bplist: { "T": 10, "V": 1, "P": <nested bplist> }
+    ///   nested P:     [ { "hashedAdvertisement": {"key":{"data": <32B SHA256(our pubkey_x)>}},
+    ///                     "entityIdentifier": <our findMyId = base64(our DSID) with '=' -> '~'>,
+    ///                     "identifier": <UUID>,
+    ///                     "privateKey": {"key":{"data": <85B = 04||x||y||priv>}},
+    ///                     "index": <int> } ]
+    /// Transport: IDS topic `com.apple.private.alloy.fmd`, command 242 (confirmed: live Android logs
+    /// show alloy.fmd content msgs carry c:242). Sent per follower handle.
+    pub async fn distribute_secure_location_key(&self, follower_handle: &str) -> Result<(), PushError> {
+        info!("[FMF-KEYDIST] === distribute_secure_location_key START for {} ===", follower_handle);
+        // Load (or generate) our persistent P-224 keypair — the SAME one publish_secure_location uses.
+        let (priv_key, pub_key, find_my_id) = {
+            let mut state = self.state.state.lock().await;
+            let (priv_arr, pub_arr, _shared) = match state.get_or_generate_secure_location_keys() {
+                Ok(k) => k,
+                Err(e) => { error!("[FMF-KEYDIST] STEP=load_keys FAIL: {:?}", e); return Err(e); }
+            };
+            self.state.save(&state)?;
+            // findMyId = base64(DSID) with '=' padding replaced by '~' (matches captured format).
+            let find_my_id = base64_encode(state.dsid.as_bytes()).replace('=', "~");
+            info!("[FMF-KEYDIST] STEP=load_keys OK dsid={} findMyId={} pub8={} priv8={}",
+                state.dsid, find_my_id, encode_hex(&pub_arr[..8]), encode_hex(&priv_arr[..8]));
+            (priv_arr, pub_arr, find_my_id)
+        };
+
+        // 85-byte key export = 04 || x(28) || y(28) || priv(28) = pub(57) || priv(28).
+        let mut key_data = Vec::with_capacity(85);
+        key_data.extend_from_slice(&pub_key);   // 57 bytes (0x04 || x || y)
+        key_data.extend_from_slice(&priv_key);  // 28 bytes (private scalar)
+        if key_data.len() != 85 {
+            error!("[FMF-KEYDIST] STEP=key_export FAIL: {} bytes (expected 85)", key_data.len());
+            return Err(PushError::KeyedArchiveError(format!("key export not 85 bytes: {}", key_data.len())));
+        }
+
+        // hashedAdvertisement = SHA256(pubkey_x); x = pub_key[1..29] (skip 0x04 prefix).
+        let key_id = sha256(&pub_key[1..29]);
+
+        info!("[FMF-KEYDIST] STEP=build key_id_b64={} (this is what the friend will fetch under)",
+            base64_encode(&key_id));
+
+        // Build the nested key record (single-element array), mirroring the inbound parser exactly.
+        let record = plist::Dictionary::from_iter([
+            ("hashedAdvertisement".to_string(), Value::Dictionary(plist::Dictionary::from_iter([
+                ("key".to_string(), Value::Dictionary(plist::Dictionary::from_iter([
+                    ("data".to_string(), Value::Data(key_id.to_vec())),
+                ]))),
+            ]))),
+            ("entityIdentifier".to_string(), Value::String(find_my_id.clone())),
+            ("identifier".to_string(), Value::String(Uuid::new_v4().to_string().to_uppercase())),
+            ("privateKey".to_string(), Value::Dictionary(plist::Dictionary::from_iter([
+                ("key".to_string(), Value::Dictionary(plist::Dictionary::from_iter([
+                    ("data".to_string(), Value::Data(key_data)),
+                ]))),
+            ]))),
+            ("index".to_string(), Value::Integer(0u32.into())),
+        ]);
+        let nested_bytes = plist_to_bin(&Value::Array(vec![Value::Dictionary(record)]))?;
+        let nested_bytes_len = nested_bytes.len();
+
+        // Outer envelope: { T: 10, V: 1, P: <nested bplist bytes> }.
+        let outer = plist::Dictionary::from_iter([
+            ("T".to_string(), Value::Integer(10u32.into())),
+            ("V".to_string(), Value::Integer(1u32.into())),
+            ("P".to_string(), Value::Data(nested_bytes)),
+        ]);
+        let payload_bytes = plist_to_bin(&Value::Dictionary(outer))?;
+
+        // Normalize handle to IDS URI format (same logic as relay_mapping_packet).
+        let uri_handle = if follower_handle.starts_with("tel:") || follower_handle.starts_with("mailto:") {
+            follower_handle.to_string()
+        } else if follower_handle.contains('@') {
+            format!("mailto:{}", follower_handle)
+        } else {
+            format!("tel:{}", follower_handle)
+        };
+
+        // Transport: secure-locations rides on com.apple.private.alloy.fmd (proven via serviceIdentifier capture).
+        let topic = "com.apple.private.alloy.fmd";
+        let our_handles = self.identity.get_handles().await;
+        if our_handles.is_empty() {
+            error!("[FMF-KEYDIST] STEP=get_handles FAIL: no IDS handles registered — cannot send");
+            return Err(PushError::KeyedArchiveError("no IDS handles available for key distribution".to_string()));
+        }
+        let handle = our_handles[0].clone();
+        info!("[FMF-KEYDIST] STEP=prepared sender={} target={} payload={}B nested={}B",
+            handle, uri_handle, payload_bytes.len(), nested_bytes_len);
+
+        info!("[FMF-KEYDIST] STEP=cache_keys begin for {}", uri_handle);
+        if let Err(e) = self.identity.cache_keys(
+            topic,
+            &[uri_handle.clone()],
+            &handle,
+            false,
+            &QueryOptions { required_for_message: true, result_expected: true },
+        ).await {
+            error!("[FMF-KEYDIST] STEP=cache_keys FAIL for {}: {:?} — friend may not be iMessage/FMF-registered on this handle", uri_handle, e);
+            return Err(e);
+        }
+        info!("[FMF-KEYDIST] STEP=cache_keys OK for {}", uri_handle);
+
+        let targets = self.identity.cache.lock().await
+            .get_participants_targets(topic, &handle, &[uri_handle.clone()]);
+        info!("[FMF-KEYDIST] STEP=targets resolved {} target(s) for {}", targets.len(), uri_handle);
+        if targets.is_empty() {
+            error!("[FMF-KEYDIST] STEP=targets FAIL: no targets for {} — friend has no device registered on com.apple.private.alloy.fmd (secure-loc capability missing?)", uri_handle);
+            // Return an error (not Ok) so the [FMF-SUMMARY] keyDist tally reflects that nothing was sent.
+            return Err(PushError::KeyedArchiveError(format!("no secure-loc targets for {}", uri_handle)));
+        }
+
+        info!("[FMF-KEYDIST] STEP=send begin (command=242, no_response=true — NOTE: Ok only means dispatched to APNs, NOT delivered/accepted by friend)");
+        match self.identity.send_message(topic, IDSSendMessage {
+            sender: handle.clone(),
+            raw: Raw::Body(payload_bytes),
+            send_delivered: false,
+            command: 242,
+            no_response: true,
+            id: Uuid::new_v4().to_string().to_uppercase(),
+            scheduled_ms: None,
+            queue_id: None,
+            relay: None,
+            extras: Dictionary::from_iter([
+                ("wA".to_string(), Value::Boolean(true))
+            ]),
+        }, targets).await {
+            Ok(_) => info!("[FMF-KEYDIST] STEP=send OK — secureLocationsKeyUpdate dispatched to {} (findMyId={}, key_id8={})",
+                uri_handle, find_my_id, encode_hex(&key_id[..8])),
+            Err(e) => {
+                error!("[FMF-KEYDIST] STEP=send FAIL for {}: {:?}", uri_handle, e);
+                return Err(e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Test function: calls offerLocation to get mapping packet tokens from Apple,
+    /// then relays them via IDS to all followers. Then publishes our location.
+    /// Returns a descriptive string for the UI snackbar.
+    pub async fn test_send_mapping_packet(&self) -> Result<String, PushError> {
+        info!("[FMF-OFFER-TEST] === Starting offerLocation + publish test ===");
+
+        // Refresh the daemon to get current followers list
+        let friend_handles: Vec<String> = {
+            let mut daemon = self.daemon.lock().await;
+            info!("[FMF-OFFER-TEST] Refreshing daemon to get followers...");
+            daemon.refresh(self.config.as_ref()).await?;
+            info!("[FMF-OFFER-TEST] Followers count: {}", daemon.followers.len());
+
+            daemon.followers.iter()
+                .filter_map(|f| {
+                    f.invitation_from_handles.first()
+                        .or_else(|| f.invitation_accepted_handles.first())
+                        .cloned()
+                })
+                .collect()
+        };
+
+        if friend_handles.is_empty() {
+            return Err(PushError::KeyedArchiveError("No followers found — need at least one person following us".to_string()));
+        }
+
+        info!("[FMF-OFFER-TEST] Calling offerLocation for {} followers (one per handle)", friend_handles.len());
+
+        // Step 1: Call offerLocation per-handle (matching 6s behavior) to get tokens
+        let mut request_tokens = HashMap::new();
+        for handle in &friend_handles {
+            match {
+                let mut daemon = self.daemon.lock().await;
+                daemon.offer_location(self.config.as_ref(), &[handle.clone()]).await
+            } {
+                Ok(tokens) => {
+                    for (k, v) in tokens {
+                        request_tokens.insert(k, v);
+                    }
+                },
+                Err(e) => {
+                    info!("[FMF-OFFER-TEST]   offerLocation failed for {}: {:?}", handle, e);
+                }
+            }
+        }
+
+        if request_tokens.is_empty() {
+            return Ok("offerLocation returned no tokens".to_string());
+        }
+
+        // Step 2: Relay each token via IDS to the friend
+        let mut sent_count = 0;
+        for (handle_id, token) in &request_tokens {
+            info!("[FMF-OFFER-TEST] Relaying token to: {} ({} chars)", handle_id, token.len());
+            match self.relay_mapping_packet(handle_id, token).await {
+                Ok(()) => { sent_count += 1; },
+                Err(e) => {
+                    info!("[FMF-OFFER-TEST]   Relay failed for {}: {:?}", handle_id, e);
+                }
+            }
+        }
+
+        info!("[FMF-OFFER-TEST] Relayed {}/{} tokens", sent_count, request_tokens.len());
+
+        // Step 3: Distribute OUR private key to every follower via secureLocationsKeyUpdate (T:10)
+        // BEFORE publishing. The real iOS capture (share-full.log) shows key-updates BEGIN before the
+        // /findmyservice/submit (T:10 at 10:36:10/12, SUBMIT at 10:36:13, more T:10 after). Sending
+        // keys first removes any server-side race where a submit lands under a key_id no follower has
+        // registered yet. Order matters per the capture; we match iOS by distributing before submit.
+        let mut key_sent = 0;
+        for handle in &friend_handles {
+            match self.distribute_secure_location_key(handle).await {
+                Ok(()) => { key_sent += 1; },
+                Err(e) => info!("[FMF-OFFER-TEST]   key distribution failed for {}: {:?}", handle, e),
+            }
+        }
+        info!("[FMF-OFFER-TEST] Distributed key to {}/{} followers", key_sent, friend_handles.len());
+
+        // Step 4: Claim me-device (source location) so our blob is the one served to followers.
+        // Without this, the account's existing me-device (iPad/6s) shadows our publish.
+        info!("[FMF-OFFER-TEST] Claiming me-device before publish...");
+        match {
+            let mut daemon = self.daemon.lock().await;
+            daemon.claim_me_device(self.config.as_ref()).await
+        } {
+            Ok(_) => info!("[FMF-OFFER-TEST] claim_me_device OK"),
+            Err(e) => info!("[FMF-OFFER-TEST] claim_me_device failed (continuing): {:?}", e),
+        }
+
+        // Step 5: Publish our location so friends (who now hold our key) can decrypt it.
+        info!("[FMF-OFFER-TEST] Publishing location...");
+        let publish_result = self.publish_secure_location(45.5017, -73.5673, 0.0, 10.0, 10.0, 0.0, 0.0).await;
+        let publish_ok = publish_result.is_ok();
+
+        // Step 5: SELF-FETCH verification — only meaningful if publish reported OK. Proves the
+        // blob is actually stored + fetchable under our key_id + decryptable (catches silent
+        // failures where a 200 stored nothing retrievable). Independent of friend delivery.
+        let mut selffetch_ok = false;
+        let mut selffetch_detail = String::from("skipped (publish failed)");
+        if publish_ok {
+            match self.verify_published_location().await {
+                Ok(loc) => {
+                    selffetch_ok = true;
+                    let lat = loc.get("latitude").and_then(|v| v.as_f64());
+                    let lon = loc.get("longitude").and_then(|v| v.as_f64());
+                    selffetch_detail = format!("lat={:?} lon={:?}", lat, lon);
+                    info!("[FMF-OFFER-TEST] self-fetch verified: {}", selffetch_detail);
+                },
+                Err(e) => {
+                    selffetch_detail = format!("{}", e);
+                    info!("[FMF-OFFER-TEST] self-fetch verification FAILED: {:?}", e);
+                }
+            }
+        }
+
+        // === SINGLE-LINE SUMMARY: tells you at a glance which step broke ===
+        // Format: followers=N | offerTokens=N | relayed=N/N | keyDist=N/N | publish=OK|FAIL
+        // Read this one line first; then grep [FMF-OFFER]/[FMF-RELAY]/[FMF-KEYDIST]/[FMF-SECURE]
+        // for the failing step's detail.
+        info!("[FMF-SUMMARY] followers={} | offerTokens={} | relayed={}/{} | keyDist={}/{} | publish={} | selfFetch={}",
+            friend_handles.len(),
+            request_tokens.len(),
+            sent_count, request_tokens.len(),
+            key_sent, friend_handles.len(),
+            if publish_ok { "OK" } else { "FAIL" },
+            if selffetch_ok { "OK" } else if publish_ok { "FAIL" } else { "SKIP" });
+        if friend_handles.is_empty() { warn!("[FMF-SUMMARY] STEP0 followers=0 — nobody to share with"); }
+        if request_tokens.is_empty() { warn!("[FMF-SUMMARY] STEP1 offerLocation produced 0 tokens — see [FMF-OFFER]"); }
+        if sent_count < request_tokens.len() { warn!("[FMF-SUMMARY] STEP2 relay incomplete — see [FMF-RELAY]"); }
+        if key_sent < friend_handles.len() { warn!("[FMF-SUMMARY] STEP3 key distribution incomplete — see [FMF-KEYDIST]"); }
+        if !publish_ok { warn!("[FMF-SUMMARY] STEP4 publish failed — see [FMF-SECURE]"); }
+        if publish_ok && !selffetch_ok { warn!("[FMF-SUMMARY] STEP5 self-fetch failed ({}) — 200 may be a silent store failure; see [FMF-SELFTEST]", selffetch_detail); }
+        if !friend_handles.is_empty() && !request_tokens.is_empty()
+            && sent_count == request_tokens.len() && key_sent == friend_handles.len() && publish_ok && selffetch_ok {
+            info!("[FMF-SUMMARY] ALL STEPS OK + self-fetch VERIFIED ({}). Our blob is stored, fetchable under our \
+                key_id, and decryptable. NOTE: key-update sends are no_response — final proof a friend SEES us \
+                still requires friend-side confirmation.", selffetch_detail);
+        }
+
+        match publish_result {
+            Ok(()) => {
+                info!("[FMF-OFFER-TEST] publish_secure_location OK");
+                Ok(format!("offerLocation: {} tokens. Relayed: {}. Key->{} followers. Published. SelfFetch: {} ({})",
+                    request_tokens.len(), sent_count, key_sent,
+                    if selffetch_ok { "VERIFIED" } else { "FAILED" }, selffetch_detail))
+            },
+            Err(e) => {
+                info!("[FMF-OFFER-TEST] publish_secure_location failed: {:?}", e);
+                Ok(format!("offerLocation: {} tokens. Relayed: {}. Key->{}. Publish failed: {}", request_tokens.len(), sent_count, key_sent, e))
+            }
+        }
+    }
+
+    /// Test function: attempt the fmip `identityV5` device registration so our
+    /// device gains a `deviceDiscoveryId` and becomes electable as `meDeviceId`
+    /// (the upstream gate for FindMy People publish — see IDENTITYV5_PLAN.md).
+    ///
+    /// Requires the relay bridge to implement the fmip signing endpoints; on any
+    /// config that can't produce the PCRT + Sign1/2 material this returns
+    /// `FmipBridgeUnsupported` and sends nothing. Returns a descriptive string for
+    /// the UI snackbar (HTTP status + response body).
+    pub async fn test_register_identity_v5(&self) -> Result<String, PushError> {
+        info!("[FMF-IDV5] === Starting identityV5 registration test ===");
+
+        let dsid = self.state.state.lock().await.dsid.clone();
+        let client = fmip_register::FmipRegisterClient {
+            dsid,
+            // fmip server shard — same random range the device-locate client uses.
+            server: rand::thread_rng().gen_range(101..=182),
+            anisette: self.anisette.clone(),
+            aps: self.conn.clone(),
+            token_provider: self.token_provider.clone(),
+        };
+
+        // pscSUILastModified: the real captured identityV5 body carries a concrete
+        // value (`1780027396090`, from quic-findmydeviced.log). Previously we sent
+        // 0 (which omits the field). For the diagnostic fresh-UDID test we send the
+        // known-good captured value so the request matches the real body shape and
+        // we don't give the edge filter a reason to reject on a missing field.
+        // (This is the 6s's PSC/Provenance pref timestamp; reused as a constant for
+        // the test. If enrollment ever works, the relay bridge should supply the
+        // device's live value instead.)
+        let psc = 1780027396090u64;
+
+        match client.register_identity_v5(self.config.as_ref(), psc).await {
+            Ok(outcome) => {
+                info!("[FMF-IDV5] identityV5 outcome: status={} uuid={}", outcome.http_status, outcome.request_uuid);
+                Ok(format!(
+                    "identityV5 status={} uuid={} body={}",
+                    outcome.http_status,
+                    outcome.request_uuid,
+                    &outcome.response_body[..outcome.response_body.len().min(300)]
+                ))
+            },
+            Err(PushError::FmipBridgeUnsupported) => {
+                info!("[FMF-IDV5] Relay bridge does not support fmip signing (expected until Task 2 lands)");
+                Ok("identityV5 unsupported: relay bridge missing fmip/pcrt + fmip/sign (Task 2)".to_string())
+            },
+            Err(e) => {
+                error!("[FMF-IDV5] identityV5 registration failed: {:?}", e);
+                Err(e)
+            }
+        }
+    }
+
+    /// READ-ONLY diagnostic: probe the relay bridge's fmip primitives and log the
+    /// results, to verify the Task 2 low-risk half (PCRT + hardware descriptor)
+    /// WITHOUT submitting anything to Apple. Fetches nothing that mutates state:
+    /// it only reads the device-hardware descriptor and the (static, reusable)
+    /// PCRT token. See IDENTITYV5_PLAN.md "VERIFICATION PROCEDURE".
+    ///
+    /// Returns a short summary string. On a config without the fmip bridge this
+    /// reports "unsupported" rather than erroring.
+    pub async fn test_probe_fmip_bridge(&self) -> Result<String, PushError> {
+        info!("[FMF-IDV5] === Probing relay fmip bridge (read-only) ===");
+
+        // 1. Hardware descriptor (from get-version-info, populated by the relay bridge).
+        match self.config.get_fmip_device_hardware() {
+            Some(hw) => {
+                info!(
+                    "[FMF-IDV5] hardware: serial={} imei={} imei2={} meid={} ecid={} chipId={} wifiMac={} btMac={}",
+                    hw.serial_number, hw.imei, hw.imei2, hw.meid, hw.ecid, hw.chip_id, hw.wifi_mac, hw.bt_mac
+                );
+                // Flag any empty field — an empty ecid/chipId/MAC means the relay's
+                // MobileGestalt key spelling needs adjusting (see plan open item).
+                for (name, val) in [
+                    ("serial", &hw.serial_number), ("imei", &hw.imei), ("meid", &hw.meid),
+                    ("ecid", &hw.ecid), ("chipId", &hw.chip_id), ("wifiMac", &hw.wifi_mac), ("btMac", &hw.bt_mac),
+                ] {
+                    if val.is_empty() {
+                        warn!("[FMF-IDV5]   hardware field '{}' is EMPTY — check the relay MobileGestalt key", name);
+                    }
+                }
+            },
+            None => info!("[FMF-IDV5] hardware descriptor unavailable (relay bridge not reporting fmip fields)"),
+        }
+
+        // 2. PCRT token (static/reusable; the identityV5 ifcReceipt).
+        match self.config.get_fmip_pcrt_token().await {
+            Ok(pcrt) => {
+                let decoded_len = base64_decode(&pcrt).len();
+                info!(
+                    "[FMF-IDV5] PCRT: len={} chars, decodes to {} bytes (expect 32), value={}",
+                    pcrt.len(), decoded_len, pcrt
+                );
+                if decoded_len != 32 {
+                    warn!("[FMF-IDV5]   PCRT does not decode to 32 bytes — token may be malformed");
+                }
+                Ok(format!("fmip probe OK — PCRT {} chars ({} bytes decoded)", pcrt.len(), decoded_len))
+            },
+            Err(PushError::FmipBridgeUnsupported) => {
+                info!("[FMF-IDV5] PCRT unsupported: relay bridge missing fmip/pcrt (Task 2 not deployed)");
+                Ok("fmip probe: bridge unsupported (relay missing fmip/pcrt)".to_string())
+            },
+            Err(e) => {
+                error!("[FMF-IDV5] PCRT fetch failed: {:?}", e);
+                Err(e)
+            }
+        }
+    }
+
+    /// TEMPORARY DIAGNOSTIC — exercises the relay `fmip-sign` bridge command with a
+    /// DUMMY 32-byte digest to reveal how the registration server maps an HTTP POST
+    /// body into the relay websocket command `data` (IDENTITYV5_PLAN.md piece-1
+    /// audit, Issue A). This is the caller needed to read the relay-side DIAG echo
+    /// once the ffb239d relay .deb is deployed. It does NOT submit anything to Apple
+    /// and does NOT mutate account state — it only asks the relay to sign a throwaway
+    /// digest. The findmydeviced shim (piece 2) does not exist yet, so on a deployed
+    /// ffb239d relay this is expected to return the DIAG error string (echoing the
+    /// raw `data` shape) or FmipBridgeUnsupported on an older relay.
+    ///
+    /// Remove once Issue A (the body -> `data` mapping) is confirmed.
+    pub async fn test_probe_fmip_sign(&self) -> Result<String, PushError> {
+        info!("[FMF-IDV5] === Probing relay fmip-sign bridge (DIAG, dummy digest) ===");
+
+        // A throwaway, clearly-recognizable 32-byte digest (0x00,0x01,...,0x1f).
+        // Nothing is signed for real; this only drives the wire-shape DIAG.
+        let digest: Vec<u8> = (0u8..32u8).collect();
+        let request_uuid = Uuid::new_v4().to_string().to_uppercase();
+        info!(
+            "[FMF-IDV5] fmip-sign DIAG: sending {}-byte dummy digest, request_uuid={}",
+            digest.len(), request_uuid
+        );
+
+        match self.config.get_fmip_signature(&digest, &request_uuid).await {
+            Ok(sig) => {
+                // Unexpected this early (piece 2 not built) — but log it fully if it happens.
+                info!(
+                    "[FMF-IDV5] fmip-sign returned a signature: sign1_len={} sign2_len={} sign5={} sign6={}",
+                    sig.sign1.len(),
+                    sig.sign2.len(),
+                    sig.sign5.as_deref().map(|s| s.len().to_string()).unwrap_or_else(|| "none".to_string()),
+                    sig.sign6.as_deref().map(|s| s.len().to_string()).unwrap_or_else(|| "none".to_string()),
+                );
+                Ok(format!(
+                    "fmip-sign OK — sign1 {} chars, sign2 {} chars",
+                    sig.sign1.len(), sig.sign2.len()
+                ))
+            },
+            Err(PushError::FmipBridgeUnsupported) => {
+                info!("[FMF-IDV5] fmip-sign unsupported: relay bridge missing fmip-sign (older relay / Task 2 not deployed)");
+                Ok("fmip-sign: bridge unsupported (relay missing fmip-sign command)".to_string())
+            },
+            Err(PushError::RelayError(status, msg)) => {
+                // On the deployed ffb239d relay this is the EXPECTED path: the DIAG
+                // echo (or the shim-unreachable error) comes back here. Log verbatim
+                // so we can read the raw `data=` shape (Issue A).
+                info!("[FMF-IDV5] fmip-sign relay response (status={}): {}", status, msg);
+                Ok(format!("fmip-sign DIAG (status={}): {}", status, msg))
+            },
+            Err(e) => {
+                error!("[FMF-IDV5] fmip-sign probe failed: {:?}", e);
+                Err(e)
+            }
+        }
+    }
+
     pub async fn sync_item_positions(&self) -> Result<(), PushError> {
-        // === TEMPORARY TEST: Submit Montreal location when syncing item positions ===
-        info!("[FMF-SUBMIT] Triggering submit_own_location from sync_item_positions");
-        match self.submit_own_location(45.5017, -73.5673, 50.0, 10.0).await {
-            Ok(()) => info!("[FMF-SUBMIT] submit_own_location succeeded!"),
-            Err(e) => info!("[FMF-SUBMIT] submit_own_location failed: {:?}", e),
+        // === TEMPORARY: Trigger an FMF (People surface) publish on every item-sync cycle.
+        //     This is the corrected path using ECIES with the publisher's own pubkey.
+        //     The previous code here called submit_own_location, which is the AirTag/Items
+        //     surface (wrong protocol for "appear under People"). See INVESTIGATION.md §22.
+        //     Throttled by FMF_AUTO_PUBLISH_MIN_INTERVAL_MS (see top of this file) so we
+        //     don't hammer Apple on every item-sync; the manual UI button is unaffected.
+        if fmf_auto_publish_should_fire() {
+            info!("[FMF-SUBMIT] Triggering publish_secure_location (FMF People surface)");
+            match self.publish_secure_location(
+                45.5017,    // latitude
+                -73.5673,   // longitude (Montreal — placeholder for testing)
+                50.0,       // altitude (m)
+                10.0,       // horizontal_accuracy (m)
+                5.0,        // vertical_accuracy (m)
+                0.0,        // speed (m/s)
+                0.0,        // course (degrees)
+            ).await {
+                Ok(()) => info!("[FMF-SUBMIT] publish_secure_location returned Ok (HTTP status logged separately)"),
+                Err(e) => error!("[FMF-SUBMIT] publish_secure_location failed: {:?}", e),
+            }
+        } else {
+            debug!("[FMF-SUBMIT] Skipping auto-publish (within {} ms throttle window)", FMF_AUTO_PUBLISH_MIN_INTERVAL_MS);
         }
         // === END TEMPORARY TEST ===
 
@@ -1755,8 +3468,102 @@ impl<P: AnisetteProvider> FindMyClient<P> {
         } else { Ok(Some((payload_data.share_identifier, attrs)))}
     }
 
+    /// Parse an inbound `secureLocationsKeyUpdate` (T:10) message and store each friend's
+    /// private key so we can fetch + decrypt their published locations.
+    ///
+    /// Wire format (proven from keyupdate-capture2.log):
+    ///   outer bplist: { "T": 10, "V": 1, "P": <nested bplist> }
+    ///   nested P bplist: [ { "hashedAdvertisement": {"key":{"data": <32B SHA256(pubkey_x)>}},
+    ///                        "entityIdentifier": <findMyId = base64(friend DSID) = Follow.id>,
+    ///                        "identifier": <UUID>,
+    ///                        "privateKey": {"key":{"data": <85B = 04||x||y||priv>}},
+    ///                        "index": <int> } ]
+    ///
+    /// Returns the number of friend keys stored/updated.
+    async fn handle_secure_locations_key_update(&self, outer: &Value) -> Result<usize, PushError> {
+        let Value::Dictionary(outer_dict) = outer else {
+            return Err(PushError::KeyedArchiveError("key update: outer not a dict".to_string()));
+        };
+
+        // Only T:10 carries key material. T:7 (self-token expiration) and others are ignored.
+        let msg_type = outer_dict.get("T").and_then(|v| v.as_unsigned_integer()).unwrap_or(0);
+        if msg_type != 10 {
+            info!("[FMF-KEYUPDATE] ignoring securelocations message T={}", msg_type);
+            return Ok(0);
+        }
+
+        let Some(Value::Data(nested_bytes)) = outer_dict.get("P") else {
+            return Err(PushError::KeyedArchiveError("key update: missing P payload".to_string()));
+        };
+
+        // Nested plist: array of key records.
+        let nested: Value = plist::from_bytes(nested_bytes)?;
+        let records = match &nested {
+            Value::Array(a) => a.clone(),
+            Value::Dictionary(_) => vec![nested.clone()],
+            _ => return Err(PushError::KeyedArchiveError("key update: nested P not array/dict".to_string())),
+        };
+
+        let mut stored = 0usize;
+        let mut state = self.state.state.lock().await;
+
+        for rec in &records {
+            let Value::Dictionary(rd) = rec else { continue };
+
+            // findMyId = entityIdentifier (= friend's Follow.id).
+            let find_my_id = rd.get("entityIdentifier").and_then(|v| v.as_string()).map(|s| s.to_string());
+            let Some(find_my_id) = find_my_id else {
+                info!("[FMF-KEYUPDATE]   record missing entityIdentifier, skipping");
+                continue;
+            };
+
+            // privateKey.key.data = 85 bytes (04 || x(28) || y(28) || priv(28)).
+            let key_data = rd.get("privateKey")
+                .and_then(|v| v.as_dictionary())
+                .and_then(|d| d.get("key"))
+                .and_then(|v| v.as_dictionary())
+                .and_then(|d| d.get("data"))
+                .and_then(|v| v.as_data());
+            let Some(key_data) = key_data else {
+                info!("[FMF-KEYUPDATE]   record for {} missing privateKey.key.data", find_my_id);
+                continue;
+            };
+
+            if key_data.len() != 85 {
+                info!("[FMF-KEYUPDATE]   record for {} has key {} bytes (expected 85), skipping", find_my_id, key_data.len());
+                continue;
+            }
+            if key_data[0] != 0x04 {
+                info!("[FMF-KEYUPDATE]   record for {} key bad prefix {:#04x}, skipping", find_my_id, key_data[0]);
+                continue;
+            }
+
+            let public_key = key_data[..57].to_vec();          // 04 || x || y
+            let private_key = key_data[57..85].to_vec();        // priv scalar
+
+            info!("[FMF-KEYUPDATE]   stored key for friend findMyId={} (pub first 8: {})",
+                find_my_id, encode_hex(&public_key[..8]));
+
+            state.friend_secure_keys.insert(find_my_id.clone(), FriendSecureLocationKeys {
+                private_key,
+                public_key,
+                shared_secret: Vec::new(),
+                find_my_id,
+            });
+            stored += 1;
+        }
+
+        if stored > 0 {
+            self.state.save(&state)?;
+        }
+        Ok(stored)
+    }
+
     pub async fn handle(&self, msg: APSMessage) -> Result<Vec<(String, String, BeaconAttributes)>, PushError> {
         if let Some(IDSRecvMessage { message_unenc: Some(message), topic, token: Some(token), target: Some(target), sender: Some(sender), uuid: Some(uuid), ns_since_epoch: Some(ns_since_epoch), .. }) = self.identity.receive_message(msg, &["com.apple.private.alloy.fmf", "com.apple.private.alloy.fmd", "com.apple.private.alloy.findmy.itemsharing-crossaccount", "com.apple.icloud.searchpartyd.securelocations"]).await? {
+            // Entry log: ALWAYS print which FMF/FMD message arrived so a missing receive can be
+            // distinguished from "arrived but failed downstream". (No payload — names only.)
+            info!("[FMF-RECV] inbound topic={} sender={} uuid={}", topic, sender, encode_hex(&uuid));
             let do_app_ack = || async {
                 let targets = self.identity.cache.lock().await.get_targets(&topic, &target, &[sender.clone()], &[MessageTarget::Token(token)])?;
                 self.identity.send_message(topic, IDSSendMessage {
@@ -1824,27 +3631,117 @@ impl<P: AnisetteProvider> FindMyClient<P> {
             // Secure locations uses com.apple.private.alloy.fmd as its IDS channel.
             // We intercept fmd messages that fail to parse as FMFPayload.
             if topic == "com.apple.private.alloy.fmd" {
-                let parsed_result: Result<FMFPayload, _> = message.plist();
+                // First try to parse as a generic plist Value to log it
+                let raw_value: Value = match message.plist() {
+                    Ok(val) => val,
+                    Err(e) => {
+                        info!("[FMF-SECURE-LOC] Message not parseable: {:?}", e);
+                        do_app_ack().await?;
+                        return Ok(vec![]);
+                    }
+                };
+
+                // Always log the top-level structure of anything on fmd so we can see whether a
+                // key-update (dict with T/V/P) vs a mapping packet (dict with p/v) vs something
+                // unexpected arrived — even if it later takes a path that doesn't log.
+                match &raw_value {
+                    Value::Dictionary(d) => {
+                        let keys: Vec<&String> = d.keys().collect();
+                        info!("[FMF-RECV] fmd dict keys={:?}", keys);
+                    },
+                    other => info!("[FMF-RECV] fmd non-dict value: {:?}", &format!("{:?}", other)[..format!("{:?}", other).len().min(120)]),
+                }
+
+                // === SECURE LOCATIONS KEY UPDATE (inbound) ===
+                // When a friend shares their location with us, they send a T:10 secureLocationsKeyUpdate
+                // on com.apple.private.alloy.fmd (PROVEN transport — serviceIdentifier captured live)
+                // containing THEIR private key. Detect the {T,V,P} envelope before the FMFPayload path.
+                if let Value::Dictionary(d) = &raw_value {
+                    if d.contains_key("T") && d.contains_key("P") {
+                        let t = d.get("T").and_then(|v| v.as_unsigned_integer()).unwrap_or(0);
+                        info!("[FMF-KEYUPDATE] securelocations envelope on fmd topic from {}: T={}", sender, t);
+                        match self.handle_secure_locations_key_update(&raw_value).await {
+                            Ok(stored) => info!("[FMF-KEYUPDATE] Stored/updated {} friend key(s)", stored),
+                            Err(e) => info!("[FMF-KEYUPDATE] parse failed: {:?}", e),
+                        }
+                        do_app_ack().await?;
+                        return Ok(vec![]);
+                    }
+                }
+
+                // Try to interpret as FMFPayload (MappingPacket)
+                let parsed_result: Result<FMFPayload, _> = plist::from_value(&raw_value);
                 match parsed_result {
                     Ok(parsed) => {
                         // Regular FMF message — handle normally
                         debug!("Find my IDS message came in as {}", encode_hex(&uuid));
                         match parsed {
                             FMFPayload::MappingPacket { p } => {
+                                info!("[FMF-MAPPING-RECV] MappingPacket on fmd topic from: {}", sender);
+                                info!("[FMF-MAPPING-RECV]   p length: {}, first 40: {}", p.len(), &p[..p.len().min(40)]);
+                                if p.starts_with('/') && p.len() > 100 {
+                                    info!("[FMF-MAPPING-RECV]   Format: v1 (modified base64, 156-byte blob)");
+                                    let b64 = p[1..].replace('~', "/");
+                                    let decoded = base64_decode(&b64);
+                                    info!("[FMF-MAPPING-RECV]   Decoded: {} bytes, byte[0]={:#04x}, is_156={}", decoded.len(), decoded.first().copied().unwrap_or(0), decoded.len() == 156);
+
+                                    // Attempt to decrypt and extract friend's key material
+                                    let mut state = self.state.state.lock().await;
+                                    if let (Some(priv_key), Some(pub_key)) = (&state.secure_locations_private_key, &state.secure_locations_public_key) {
+                                        let priv_arr: [u8; 28] = priv_key.clone().try_into().unwrap_or([0u8; 28]);
+                                        let pub_arr: [u8; 57] = pub_key.clone().try_into().unwrap_or([0u8; 57]);
+                                        match Self::decrypt_inbound_mapping_packet(&priv_arr, &pub_arr, &p) {
+                                            Ok(friend_keys) => {
+                                                info!("[FMF-MAPPING-RECV]   DECRYPT SUCCESS! Stored keys for sender: {}", sender);
+                                                state.friend_secure_keys.insert(sender.clone(), friend_keys);
+                                                let _ = self.state.save(&state);
+                                            },
+                                            Err(e) => {
+                                                info!("[FMF-MAPPING-RECV]   Decrypt failed (need friend's pubkey): {:?}", e);
+                                            }
+                                        }
+                                    } else {
+                                        info!("[FMF-MAPPING-RECV]   No secure location keys yet, can't attempt decrypt");
+                                    }
+                                    drop(state);
+                                } else if p.len() == 36 && p.chars().filter(|c| *c == '-').count() == 4 {
+                                    info!("[FMF-MAPPING-RECV]   Format: v5 UUID: {}", p);
+                                } else {
+                                    info!("[FMF-MAPPING-RECV]   Format: unknown (len={})", p.len());
+                                }
                                 do_app_ack().await?;
-                                debug!("Importing find my token {p}!");
-                                self.daemon.lock().await.import(self.config.as_ref(), &p).await?;
-                                debug!("Imported find my token {p}!");
+                                match self.daemon.lock().await.import(self.config.as_ref(), &p).await {
+                                    Ok(()) => info!("[FMF-MAPPING-RECV]   import() succeeded"),
+                                    Err(e) => info!("[FMF-MAPPING-RECV]   import() failed: {:?}", e),
+                                }
                             }
                         }
                         return Ok(vec![])
                     },
                     Err(_) => {
-                        // NOT a regular FMF message — likely a secure location message!
+                        // NOT a MappingPacket — likely a secure location payload or key update
                         info!("[FMF-SECURE-LOC] Received non-FMF message on fmd topic!");
                         info!("[FMF-SECURE-LOC] Sender: {}", sender);
                         info!("[FMF-SECURE-LOC] Target: {}", target);
-                        info!("[FMF-SECURE-LOC] (Could not parse as FMFPayload — this may be a secure location request)");
+                        info!("[FMF-SECURE-LOC] Plist value: {:?}", &format!("{:?}", raw_value)[..format!("{:?}", raw_value).len().min(1000)]);
+                        // Extract known v5 fields from the plist dictionary if present
+                        if let Value::Dictionary(ref dict) = raw_value {
+                            if let Some(p_val) = dict.get("p") {
+                                info!("[FMF-SECURE-LOC]   p = {:?}", &format!("{:?}", p_val)[..format!("{:?}", p_val).len().min(200)]);
+                            }
+                            if let Some(v_val) = dict.get("v") {
+                                info!("[FMF-SECURE-LOC]   v = {:?}", v_val);
+                            }
+                            if let Some(c_val) = dict.get("c") {
+                                info!("[FMF-SECURE-LOC]   c = {:?}", &format!("{:?}", c_val)[..format!("{:?}", c_val).len().min(200)]);
+                            }
+                            if let Some(s_val) = dict.get("s") {
+                                info!("[FMF-SECURE-LOC]   s = {:?}", &format!("{:?}", s_val)[..format!("{:?}", s_val).len().min(200)]);
+                            }
+                            // Log all top-level keys for discovery
+                            let keys: Vec<&String> = dict.keys().collect();
+                            info!("[FMF-SECURE-LOC]   All keys: {:?}", keys);
+                        }
                         do_app_ack().await?;
                         return Ok(vec![])
                     }
@@ -1856,11 +3753,43 @@ impl<P: AnisetteProvider> FindMyClient<P> {
             debug!("Find my IDS message came in as {}", encode_hex(&uuid));
             match parsed {
                 FMFPayload::MappingPacket { p } => {
-                    do_app_ack().await?;
-                    debug!("Importing find my token {p}!");
+                    info!("[FMF-MAPPING-RECV] MappingPacket on fmf topic from: {}", sender);
+                    info!("[FMF-MAPPING-RECV]   p length: {}, first 40: {}", p.len(), &p[..p.len().min(40)]);
+                    if p.starts_with('/') && p.len() > 100 {
+                        info!("[FMF-MAPPING-RECV]   Format: v1 (modified base64, 156-byte blob)");
+                        let b64 = p[1..].replace('~', "/");
+                        let decoded = base64_decode(&b64);
+                        info!("[FMF-MAPPING-RECV]   Decoded: {} bytes, byte[0]={:#04x}, is_156={}", decoded.len(), decoded.first().copied().unwrap_or(0), decoded.len() == 156);
 
-                    self.daemon.lock().await.import(self.config.as_ref(), &p).await?;
-                    debug!("Imported find my token {p}!");
+                        // Attempt to decrypt and extract friend's key material
+                        let mut state = self.state.state.lock().await;
+                        if let (Some(priv_key), Some(pub_key)) = (&state.secure_locations_private_key, &state.secure_locations_public_key) {
+                            let priv_arr: [u8; 28] = priv_key.clone().try_into().unwrap_or([0u8; 28]);
+                            let pub_arr: [u8; 57] = pub_key.clone().try_into().unwrap_or([0u8; 57]);
+                            match Self::decrypt_inbound_mapping_packet(&priv_arr, &pub_arr, &p) {
+                                Ok(friend_keys) => {
+                                    info!("[FMF-MAPPING-RECV]   DECRYPT SUCCESS! Stored keys for sender: {}", sender);
+                                    state.friend_secure_keys.insert(sender.clone(), friend_keys);
+                                    let _ = self.state.save(&state);
+                                },
+                                Err(e) => {
+                                    info!("[FMF-MAPPING-RECV]   Decrypt failed (need friend's pubkey): {:?}", e);
+                                }
+                            }
+                        } else {
+                            info!("[FMF-MAPPING-RECV]   No secure location keys yet, can't attempt decrypt");
+                        }
+                        drop(state);
+                    } else if p.len() == 36 && p.chars().filter(|c| *c == '-').count() == 4 {
+                        info!("[FMF-MAPPING-RECV]   Format: v5 UUID: {}", p);
+                    } else {
+                        info!("[FMF-MAPPING-RECV]   Format: unknown (len={})", p.len());
+                    }
+                    do_app_ack().await?;
+                    match self.daemon.lock().await.import(self.config.as_ref(), &p).await {
+                        Ok(()) => info!("[FMF-MAPPING-RECV]   import() succeeded"),
+                        Err(e) => info!("[FMF-MAPPING-RECV]   import() failed: {:?}", e),
+                    }
                 }
             }
         }
@@ -1936,6 +3865,37 @@ pub struct Location {
     pub position_type: Option<String>,
     pub is_old: Option<bool>,
     pub location_finished: Option<bool>,
+}
+
+/// Convert a decrypted secure-location JSON payload (from findmyservice/fetch) into a
+/// `Location`. The plaintext schema matches what `publish_secure_location` produces:
+/// `latitude`, `longitude`, `altitude`, `horizontalAccuracy`, `verticalAccuracy`,
+/// `timestamp` (Cocoa epoch seconds since 2001-01-01), etc.
+pub fn location_from_secure_json(j: &serde_json::Value) -> Option<Location> {
+    let latitude = j.get("latitude").and_then(|v| v.as_f64())?;
+    let longitude = j.get("longitude").and_then(|v| v.as_f64())?;
+
+    // timestamp is Cocoa epoch (seconds since 2001-01-01). Convert to Unix ms.
+    let cocoa_secs = j.get("timestamp").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let unix_ms = ((cocoa_secs + 978307200.0) * 1000.0) as i64;
+
+    Some(Location {
+        address: None,
+        altitude: j.get("altitude").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        floor_level: j.get("floor").and_then(|v| v.as_i64()).unwrap_or(0),
+        horizontal_accuracy: j.get("horizontalAccuracy").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        is_inaccurate: false,
+        latitude,
+        location_id: None,
+        location_timestamp: Some(unix_ms),
+        longitude,
+        secure_location_ts: unix_ms,
+        timestamp: unix_ms,
+        vertical_accuracy: j.get("verticalAccuracy").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        position_type: Some("secure".to_string()),
+        is_old: Some(false),
+        location_finished: Some(true),
+    })
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -2250,20 +4210,11 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
             let _ = self.make_request::<serde_json::Value>(config, if self.daemon { "initClient" } else { "first/initClient" }, json!({})).await?;
             self.has_init = true;
         } else {
-            // === TEMPORARY TEST: submit location via /findmyservice/v2/submit ===
-            if !self.daemon {
-                // Only trigger once from the non-daemon client (the one the alpha app uses)
-                static SUBMITTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                if !SUBMITTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    info!("[FMF-SUBMIT] Attempting standalone submit from FindMyFriendsClient");
-                    match self.submit_location_standalone(config, 45.5017, -73.5673, 50.0, 10.0).await {
-                        Ok(()) => info!("[FMF-SUBMIT] Standalone submit succeeded!"),
-                        Err(e) => info!("[FMF-SUBMIT] Standalone submit failed: {:?}", e),
-                    }
-                }
-            }
-            // === END TEMPORARY TEST ===
-
+            // The submit_location_standalone path used to fire here as a one-shot test.
+            // It's been removed because it targets the legacy /fmipservice REST endpoint
+            // which Apple silently ignores (see INVESTIGATION.md §1b). The corrected
+            // FMF People-surface publish path now goes through publish_secure_location,
+            // triggered from sync_item_positions and refresh_background_following.
             let path = if self.selected_friend.is_some() { "minCallback/selFriend/refreshClient" } else { "minCallback/refreshClient" };
             match self.make_request::<serde_json::Value>(config, path, json!({})).await {
                 Ok(response) => {
@@ -2279,7 +4230,264 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
     }
 
     pub async fn import(&mut self, config: &dyn OSConfig, url: &str) -> Result<(), PushError> {
-        let _ = self.make_request::<serde_json::Value>(config, "import", json!({"url": url})).await?;
+        let response = self.make_request::<serde_json::Value>(config, "import", json!({"url": url})).await?;
+        info!("[FMF-SECURE] Import response: {:?}", response);
+        Ok(())
+    }
+
+    /// "Use this as my location" equivalent — claims the relay device as the account's location source.
+    ///
+    /// PROVEN via Ghidra (2026-07-16) — the actual button flow:
+    ///   FMFClientSession setActiveDevice:completion:  (@ 1000209b8)
+    ///     -> FMFCommandManager setActiveDevice:forSession:completion:  (@ 10004c7c4)
+    ///        (note: forSession is passed NULL — no per-call session is bound)
+    ///        -> alloc FMFSavePrefsCommand initWithClientSession:device:
+    ///           -> sendCommand:completionBlock:
+    /// FMFSavePrefsCommand:
+    ///   - pathSuffix        = "savePrefs"                      (CFString @ 0x10008f500)
+    ///   - jsonBodyDictionary = { meDeviceId: activeDevice.deviceId }  (@ 100014cec)
+    ///
+    /// This is a DIFFERENT command from FMFSaveMeCommand (pathSuffix "saveme/savePrefs",
+    /// body { meDeviceId: self.deviceId }). We previously targeted saveme/savePrefs by
+    /// mistake — the button never uses it.
+    ///
+    /// Without this call, the account's me-device stays as whatever Apple last saw (iPad/6s), and our
+    /// published blob gets shadowed — followers fetch the me-device's blob, not ours.
+    pub async fn claim_me_device(&mut self, config: &dyn OSConfig) -> Result<serde_json::Value, PushError> {
+        // Strategy: first establish an fmfd session (refreshClient), then send the
+        // savePrefs / saveme A/B.
+        //
+        // IDENTITY FIX (proven from logs 2026-07-16): the account's device list (the
+        // `devices` array in the initClient response) contains OUR device as the 64-char
+        // config.get_udid() hash — this is exactly what the server echoes as
+        // myInfo.deviceId ("5b1f4f4f...c03466"). The relay's 40-char *hardware* UDID
+        // (f343dd29...) is NOT in the device list at all. When we sent the hardware UDID
+        // as meDeviceId, the server could not match it to any listed device and silently
+        // dropped it (prefs-only response, no myInfo). So meDeviceId MUST be the
+        // base64-tilde of config.get_udid(), not get_hardware_udid().
+        //
+        // NOTE: this UDID is a random per-install hash (generate_udid), but it is the
+        // identity the server has on file for this device, so it is the correct value.
+        let dev_udid = config.get_udid();
+        let hw_udid_lower = dev_udid.to_lowercase();
+        let hw_udid_upper = dev_udid.to_uppercase();
+        let hw_id_b64 = base64_encode(hw_udid_lower.as_bytes()).replace('=', "~");
+        
+        info!("[FMF-MEDEVICE] Step 1: Establishing fmfd session via refreshClient (registered device UDID)");
+        info!("[FMF-MEDEVICE]   dev_udid={} | meDeviceId will be base64-tilde of this (matches myInfo.deviceId)",
+            hw_udid_lower);
+        
+        let token = self.token_provider.get_mme_token("mmeFMFAppToken").await?;
+        let ms_since_epoch = duration_since_epoch().as_millis() as f64 / 1000f64;
+        let meta = config.get_debug_meta();
+        let reg = config.get_register_meta();
+        let aps_token = encode_hex(&self.aps.get_token().await).to_uppercase();
+        
+        // Step 1: refreshClient (clientSessionCreated) — establishes the session
+        let refresh_url = format!("https://p{}-fmfmobile.icloud.com/fmipservice/friends/fmfd/{}/{}/clientSessionCreated/refreshClient",
+            self.server, self.dsid, hw_udid_upper);
+        
+        let refresh_body = json!({
+            "clientContext": {
+                "appName": "fmfd",
+                "appVersion": "7.0",
+                "apsToken": aps_token,
+                "buildVersion": reg.software_version,
+                "countryCode": "US",
+                "currentTime": ms_since_epoch,
+                "deviceClass": "iPhone",
+                "deviceHasPasscode": false,
+                "deviceUDID": hw_udid_lower,
+                "fencingEnabled": true,
+                "isFMFAppRemoved": false,
+                "osVersion": meta.user_version,
+                "platform": "iphoneos",
+                "productType": meta.hardware_version,
+                "selectedFriend": self.selected_friend,
+                "regionCode": "US",
+                "timezone": "EST, -18000",
+                "unlockState": 0,
+            },
+            "dataContext": self.data_context,
+            "serverContext": self.server_context,
+        });
+        
+        let refresh_response = REQWEST.post(&refresh_url)
+            .headers(get_find_my_headers(config, "2.0", &mut *self.anisette.lock().await, "FMFD/1.0").await?)
+            .header("X-FMF-Model-Version", "1")
+            .basic_auth(&self.dsid, Some(&token))
+            .json(&refresh_body)
+            .send().await?;
+        
+        let refresh_status = refresh_response.status();
+        let refresh_result: serde_json::Value = refresh_response.json().await?;
+        info!("[FMF-MEDEVICE] Step 1 refreshClient: HTTP {} | myInfo.meDeviceId={}",
+            refresh_status,
+            refresh_result.get("myInfo").and_then(|m| m.get("meDeviceId")).and_then(|v| v.as_str()).unwrap_or("<none>"));
+        
+        // Update our session context from the refresh response
+        if let Ok(update) = serde_json::from_value::<FindMyFriendsStateUpdate>(refresh_result.clone()) {
+            self.data_context = update.data_context;
+            self.server_context = update.server_context;
+        }
+        
+        // Step 2: A/B TEST of the two me-device endpoints (proven via Ghidra 2026-07-16).
+        //
+        // There are two sibling command classes that both set meDeviceId, triggered by
+        // DIFFERENT UI flows:
+        //   FMFSavePrefsCommand -> pathSuffix "savePrefs"        (user picker, body { meDeviceId: chosenDevice })
+        //   FMFSaveMeCommand    -> pathSuffix "saveme/savePrefs" (server SAVEME alert, body { meDeviceId: thisDevice })
+        //
+        // A real device in our situation (account already has a me-device) uses the
+        // picker path -> "savePrefs". But saveme/savePrefs is not inherently wrong since
+        // we pass our own device id, which is what SaveMe expects too. We try savePrefs
+        // FIRST, and only fall back to saveme/savePrefs if the switch didn't take, so a
+        // single rebuild gives a clean A/B in the logs.
+        let candidate_suffixes = ["savePrefs", "saveme/savePrefs"];
+        let mut last_result = serde_json::Value::Null;
+
+        for (idx, suffix) in candidate_suffixes.iter().enumerate() {
+            info!("[FMF-MEDEVICE] Step 2.{}: POST {} with meDeviceId={}", idx, suffix, hw_id_b64);
+
+            let url = format!("https://p{}-fmfmobile.icloud.com/fmipservice/friends/fmfd/{}/{}/{}",
+                self.server, self.dsid, hw_udid_upper, suffix);
+
+            let body = json!({
+                "clientContext": {
+                    "appName": "fmfd",
+                    "appVersion": "7.0",
+                    "apsToken": aps_token,
+                    "buildVersion": reg.software_version,
+                    "countryCode": "US",
+                    "currentTime": duration_since_epoch().as_millis() as f64 / 1000f64,
+                    "deviceClass": "iPhone",
+                    "deviceHasPasscode": false,
+                    "deviceUDID": hw_udid_lower,
+                    "fencingEnabled": true,
+                    "isFMFAppRemoved": false,
+                    "osVersion": meta.user_version,
+                    "platform": "iphoneos",
+                    "productType": meta.hardware_version,
+                    "selectedFriend": self.selected_friend,
+                    "regionCode": "US",
+                    "timezone": "EST, -18000",
+                    "unlockState": 0,
+                },
+                "dataContext": self.data_context,
+                "serverContext": self.server_context,
+                "meDeviceId": hw_id_b64,
+            });
+
+            let response = REQWEST.post(&url)
+                .headers(get_find_my_headers(config, "2.0", &mut *self.anisette.lock().await, "FMFD/1.0").await?)
+                .header("X-FMF-Model-Version", "1")
+                .basic_auth(&self.dsid, Some(&token))
+                .json(&body)
+                .send().await?;
+
+            let status = response.status();
+            let result: serde_json::Value = response.json().await?;
+            let resp_str = serde_json::to_string(&result).unwrap_or_default();
+            info!("[FMF-MEDEVICE] Step 2.{} [{}]: HTTP {} ({}B): {}",
+                idx, suffix, status, resp_str.len(), resp_str.chars().take(800).collect::<String>());
+
+            // Update session context from each response so the fallback uses fresh context.
+            if let Ok(update) = serde_json::from_value::<FindMyFriendsStateUpdate>(result.clone()) {
+                self.data_context = update.data_context;
+                self.server_context = update.server_context;
+            }
+
+            let switched = result.get("myInfo")
+                .and_then(|m| m.get("meDeviceId"))
+                .and_then(|v| v.as_str())
+                .map(|id| id == hw_id_b64)
+                .unwrap_or(false);
+
+            if let Some(my_info) = result.get("myInfo") {
+                let resp_me_device_id = my_info.get("meDeviceId").and_then(|v| v.as_str()).unwrap_or("<missing>");
+                info!("[FMF-MEDEVICE] Step 2.{} [{}] response myInfo.meDeviceId={}", idx, suffix, resp_me_device_id);
+            } else {
+                info!("[FMF-MEDEVICE] Step 2.{} [{}] ⚠ No myInfo in response", idx, suffix);
+            }
+
+            last_result = result;
+
+            if switched {
+                info!("[FMF-MEDEVICE] ✓ SUCCESS via '{}' — relay is now the me-device!", suffix);
+                return Ok(last_result);
+            }
+
+            info!("[FMF-MEDEVICE] ✗ '{}' did not switch meDeviceId; {}",
+                suffix,
+                if idx + 1 < candidate_suffixes.len() { "trying next endpoint" } else { "no more endpoints" });
+        }
+
+        info!("[FMF-MEDEVICE] ✗ Neither endpoint switched the me-device — blocker is likely server-side device eligibility policy, not the endpoint.");
+        Ok(last_result)
+    }
+
+    /// Call offerLocation endpoint to get mapping packet tokens for followers.
+    /// Apple returns `commandResponse.requestTokens`: a dict of {handleId: p_blob_string}.
+    /// These tokens must be relayed via IDS to each friend for them to see our location.
+    /// Idempotent — safe to call for existing followers (no notification spam).
+    pub async fn offer_location(&mut self, config: &dyn OSConfig, handles: &[String]) -> Result<HashMap<String, String>, PushError> {
+        info!("[FMF-OFFER] Calling offerLocation for {} handles", handles.len());
+
+        // Build idsValidatedHandles dict: {handle: 1, handle: 1, ...}
+        let ids_validated: serde_json::Map<String, serde_json::Value> = handles.iter()
+            .map(|h| (h.clone(), serde_json::Value::Number(1.into())))
+            .collect();
+
+        let response: serde_json::Value = self.make_request(config, "offerLocation", json!({
+            "idsValidatedHandles": ids_validated,
+            "groupId": "kFMFGroupIdOneToOne",
+            "expires": 0,
+        })).await?;
+
+        info!("[FMF-OFFER] Raw response keys: {:?}", response.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+
+        // Extract commandResponse.requestTokens
+        let tokens = response.get("commandResponse")
+            .and_then(|cr| {
+                info!("[FMF-OFFER] commandResponse keys: {:?}", cr.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+                cr.get("requestTokens")
+            })
+            .and_then(|rt| rt.as_object());
+
+        let mut result = HashMap::new();
+        if let Some(token_map) = tokens {
+            for (handle_id, token_value) in token_map {
+                if let Some(token_str) = token_value.as_str() {
+                    info!("[FMF-OFFER]   token for {}: {} chars", handle_id, token_str.len());
+                    result.insert(handle_id.clone(), token_str.to_string());
+                }
+            }
+        }
+        info!("[FMF-OFFER] Got {} requestTokens", result.len());
+        Ok(result)
+    }
+
+    /// Ask a friend to share their location with us (invite).
+    /// No requestTokens returned — the friend gets a notification to accept.
+    pub async fn invite_friend(&mut self, config: &dyn OSConfig, handle: &str) -> Result<(), PushError> {
+        info!("[FMF-INVITE] Inviting {} to share their location", handle);
+        let response: serde_json::Value = self.make_request(config, "invite", json!({
+            "emails": [handle],
+            "groupId": "kFMFGroupIdOneToOne",
+            "expires": 0,
+        })).await?;
+        info!("[FMF-INVITE] Invite sent to {}. Response keys: {:?}", handle, response.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+        Ok(())
+    }
+
+    /// Stop sharing our location with specific friends.
+    pub async fn stop_sharing(&mut self, config: &dyn OSConfig, handles: &[String]) -> Result<(), PushError> {
+        info!("[FMF-STOP] Stopping sharing with {} handles", handles.len());
+        let response: serde_json::Value = self.make_request(config, "stopOffer", json!({
+            "handles": handles,
+            "groupId": "kFMFGroupIdOneToOne",
+        })).await?;
+        info!("[FMF-STOP] Stopped sharing. Response keys: {:?}", response.as_object().map(|o| o.keys().collect::<Vec<_>>()));
         Ok(())
     }
 
@@ -2361,13 +4569,11 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
         Ok(())
     }
 
-    /// Post the device's current GPS coordinates to Apple's FMF server.
-    /// This makes the device appear as a trackable location source for friends
-    /// who are "following" this user in Find My.
+    /// Post the device's current GPS coordinates to Apple's FMF server (LEGACY).
+    /// This uses the old REST-based refreshClient endpoint which Apple may silently ignore.
+    /// Prefer publish_secure_location() for the modern People surface.
     ///
     /// Requires daemon mode to be enabled (the client must be initialized with daemon=true).
-    /// The location field name is an educated guess based on the existing protocol structure —
-    /// if Apple uses a different field name, this will need to be updated after protocol capture.
     pub async fn post_location(
         &mut self,
         config: &dyn OSConfig,

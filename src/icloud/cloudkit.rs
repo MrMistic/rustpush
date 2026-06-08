@@ -154,7 +154,7 @@ pub fn pcs_keys_for_record(record: &Record, keys: &PCSZoneConfig) -> Result<PCSE
         if !keys.default_record_keys.iter().any(|i| i.key_id().ok().map(|id| pcskey == &id[..pcskey.len()]).unwrap_or(false)) {
             return Err(PushError::PCSRecordKeyMissing);
         }
-        
+
         return Ok(PCSEncryptor { keys: keys.default_record_keys.clone(), record_id })
     };
     Ok(PCSEncryptor { keys: keys.decode_record_protection(protection)?, record_id })
@@ -1350,6 +1350,7 @@ pub struct QueryResult<T: CloudKitRecord> {
 pub struct PCSZoneConfig {
     identifier: RecordZoneIdentifier,
     zone_keys: Vec<CompactECKey<Private>>,
+    record_keys: Vec<CompactECKey<Private>>,
     zone_protection_tag: Option<String>,
     default_record_keys: Vec<PCSKey>,
     pub record_prot_tag: Option<String>,
@@ -1359,11 +1360,18 @@ pub struct PCSZoneConfig {
 }
 
 impl PCSZoneConfig {
-    fn decode_record_protection(&self, protection: &ProtectionInfo) -> Result<Vec<PCSKey>, PushError> {
+    pub fn decode_record_protection(&self, protection: &ProtectionInfo) -> Result<Vec<PCSKey>, PushError> {
         let record_protection = PCSShareProtection::from_protection_info(protection);
-        let (key, _record_keys) = record_protection.decode(&self.zone_keys, None::<&CompactECKey<Public>>).unwrap();
-
+        // Use record_keys (from zone's record_protection_info) to decode per-record protection.
+        // Fall back to zone_keys if no record_keys available.
+        let keys_to_use = if self.record_keys.is_empty() { &self.zone_keys } else { &self.record_keys };
+        let (key, _) = record_protection.decode(keys_to_use, None::<&CompactECKey<Public>>)?;
         Ok(key)
+    }
+
+    /// Get the zone's EC private keys for asset key unwrapping
+    pub fn get_zone_keys(&self) -> &[CompactECKey<Private>] {
+        &self.zone_keys
     }
 }
 
@@ -1497,11 +1505,17 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                 let zone_name = zone_id.value.as_ref().unwrap().name().to_string();
                 let zone_protection = PCSShareProtection::from_protection_info(zone.protection_info.as_ref().unwrap());
 
-                let service = PCSPrivateKey::get_service_key(client, pcs_service, self.client.config.as_ref()).await?;
+                // Only fetch/create service key for SharedDb — PrivateDb decryption
+                // uses decrypt_with_keychain which finds keys by public key match,
+                // not via the service key.
+                let service = if self.database_type == Database::SharedDb {
+                    Some(PCSPrivateKey::get_service_key(client, pcs_service, self.client.config.as_ref()).await?)
+                } else { None };
                 
                 let data = client.state.read().await;
                 let decrypt = (|| -> Result<_, PushError> {
                     let (parent_keys, keys) = if self.database_type == Database::SharedDb {
+                        let service = service.as_ref().unwrap();
                         let raw = share_info.expect("No share info provided??");
                         let my_participant = self.get_my_participant(&service, &raw);
                         if my_participant.state() == 3 {
@@ -1528,6 +1542,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                     let mut keys = PCSZoneConfig {
                         identifier: zone_id.clone(),
                         zone_keys: keys,
+                        record_keys: vec![],
                         zone_protection_tag: zone.protection_info.as_ref().unwrap().protection_info_tag.clone(),
                         default_record_keys: vec![],
                         record_prot_tag: if let Some(record_protection_info) = &zone.record_protection_info {
@@ -1540,9 +1555,10 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
 
                     if let Some(record_protection_info) = &zone.record_protection_info {
                         let record_protection = PCSShareProtection::from_protection_info(record_protection_info);
-                        let (key, _record_keys) = record_protection.decode(&keys.zone_keys, None::<&CompactECKey<Public>>).unwrap();
+                        let (key, record_ec_keys) = record_protection.decode(&keys.zone_keys, None::<&CompactECKey<Public>>)?;
                         keys.record_roll_count = record_protection.get_roll_count();
                         keys.default_record_keys = key;
+                        keys.record_keys = record_ec_keys;
                     }
 
                     Ok(keys)

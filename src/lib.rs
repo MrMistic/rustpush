@@ -13,6 +13,7 @@ pub mod icloud;
 pub mod statuskit;
 pub mod passwords;
 pub mod notes;
+pub mod sticker_sync;
 pub use imessage::cloud_messages;
 pub use imessage::posterkit;
 pub use util::KeyedArchive;
@@ -77,6 +78,47 @@ pub struct DebugMeta {
     pub serial_number: String,
 }
 
+/// Genuine iPhone hardware identifiers required by the fmip `identityV5`
+/// registration body. Sourced from the relay device (activation record +
+/// MobileGestalt). See `findmy::fmip_register` and IDENTITYV5_PLAN.md Task 3.
+///
+/// Field values mirror the captured real body
+/// (tools/findmy-capture/captures/quic-findmydeviced.log line 344), e.g.
+/// `ecid`/`chip_id` are the pre-formatted `0x%llx` strings the wire uses.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct FmipDeviceHardware {
+    pub serial_number: String,
+    /// IMEI ("355684070514858"). Omitted from the body if empty.
+    pub imei: String,
+    /// Second IMEI (dual-SIM). Omitted from the body if empty.
+    pub imei2: String,
+    /// MEID ("35568407051485"). Omitted from the body if empty.
+    pub meid: String,
+    /// ECID pre-formatted as `0x%llx` (e.g. "0x574c1208363ba").
+    pub ecid: String,
+    /// chipId pre-formatted as `0x%llx` (e.g. "0x8003").
+    pub chip_id: String,
+    /// Wi-Fi MAC ("1c:91:48:52:87:db").
+    pub wifi_mac: String,
+    /// Bluetooth MAC ("1c:91:48:52:87:dc").
+    pub bt_mac: String,
+}
+
+/// Output of `FMDAbsintheV3SigningInterface signatureForData:` for an
+/// identityV5 registration: the mandatory Sign1/2 pair plus the optional,
+/// best-effort BAA Sign5/6 attestation headers.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct FmipSignature {
+    /// X-Mme-Sign1 (signatureHeader), base64.
+    pub sign1: String,
+    /// X-Mme-Sign2 (skAuthHeader), base64.
+    pub sign2: String,
+    /// X-Mme-Sign5 (baaAttestationHeader), base64. Optional.
+    pub sign5: Option<String>,
+    /// X-Mme-Sign6 (baaSignatureHeader), base64. Optional.
+    pub sign6: Option<String>,
+}
+
 #[async_trait]
 pub trait OSConfig: Sync + Send {
     fn build_activation_info(&self, csr: Vec<u8>) -> ActivationInfo;
@@ -96,6 +138,44 @@ pub trait OSConfig: Sync + Send {
     fn get_gsa_hardware_headers(&self) -> HashMap<String, String>;
     fn get_aoskit_version(&self) -> String;
     fn get_udid(&self) -> String;
+
+    /// Returns the real hardware UDID (e.g. the relay device's actual Apple UDID).
+    /// Defaults to get_udid() but relay overrides to return version.unique_device_id.
+    fn get_hardware_udid(&self) -> String {
+        self.get_udid()
+    }
+
+    /// fmip identityV5 device-hardware descriptor, read from the underlying device.
+    ///
+    /// These are the genuine iPhone hardware identifiers the fmip `identityV5`
+    /// registration requires (imei/meid/ecid/chipId/wifi+bt MAC). They are only
+    /// available on a real activated iPhone (the relay), so the default returns
+    /// `None` and the identityV5 path is a no-op for non-relay configs.
+    ///
+    /// See `findmy::fmip_register` and IDENTITYV5_PLAN.md Task 3.
+    fn get_fmip_device_hardware(&self) -> Option<FmipDeviceHardware> {
+        None
+    }
+
+    /// Fetch the MobileActivation PCRT token (`ifcReceipt`) from the device.
+    ///
+    /// PROVEN static/reusable per device (see SESSION_..._FINDINGS 2026-07-16). On
+    /// the relay this maps to a bridge call to `_MAECopyPCRTToken`. Standalone-safe.
+    /// Default: unsupported (only the relay can produce a genuine token).
+    async fn get_fmip_pcrt_token(&self) -> Result<String, PushError> {
+        Err(PushError::FmipBridgeUnsupported)
+    }
+
+    /// Produce the identityV5 request signature via the device's
+    /// `FMDAbsintheV3SigningInterface signatureForData:` (Cadmium/PSC-bound).
+    ///
+    /// `digest` is SHA256(authHeaderValue || bodyJSON); `request_uuid` is the
+    /// X-Apple-AL-ID value. Returns the Sign1/2 pair (+ optional BAA Sign5/6).
+    /// This is the ONE gate that must run inside findmydeviced context on the
+    /// relay (see IDENTITYV5_PLAN.md §Task 2 correction). Default: unsupported.
+    async fn get_fmip_signature(&self, _digest: &[u8], _request_uuid: &str) -> Result<FmipSignature, PushError> {
+        Err(PushError::FmipBridgeUnsupported)
+    }
 
     fn get_adi_mme_info(&self, for_item: &str, require_mac: bool) -> String {
         self.get_mme_clientinfo(for_item)

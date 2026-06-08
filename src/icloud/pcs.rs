@@ -433,6 +433,11 @@ impl PCSKey {
         Self(rand::random::<[u8; 16]>().to_vec())
     }
 
+    /// Get the raw symmetric key bytes (for asset key unwrapping)
+    pub fn raw_key_bytes(&self) -> Vec<u8> {
+        self.0.clone()
+    }
+
     // AKA object key
     fn master_ec_key(&self) -> Result<EcKey<Private>, PushError> {
         let mut ctx = BigNumContext::new().unwrap();
@@ -498,7 +503,9 @@ impl PCSKey {
 
         let mut text = ciphertext[header_len + 12 + tag_len..].to_vec();
 
-        gcm.decrypt_in_place_detached(Nonce::from_slice(iv), &[firstaad, aad].concat(), &mut text, Tag::from_slice(tag)).expect("GCM error?");
+        let full_aad = [firstaad, aad].concat();
+        gcm.decrypt_in_place_detached(Nonce::from_slice(iv), &full_aad, &mut text, Tag::from_slice(tag))
+            .map_err(|_| PushError::AESGCMError)?;
         Ok(text)
     }
 
@@ -538,17 +545,35 @@ pub struct PCSEncryptor {
 impl CloudKitEncryptor for PCSEncryptor {
     fn decrypt_data(&self, dec: &[u8], field_name: &str) -> Vec<u8> {
         let (required_key, _) = get_ciphertext_key(dec);
+        let key = self.keys.iter()
+            .find(|k| &k.key_id().unwrap()[..required_key.len()] == &required_key[..])
+            .expect("required key not found!");
 
-        let tag = format!("{}-{}-{}", self.record_id.zone_identifier.as_ref().unwrap().value.as_ref().unwrap().name(), self.record_id.value.as_ref().unwrap().name(), field_name);
+        // Apple's AAD format for CloudKit records: just the raw UTF-8 field
+        // name. Verified via Frida hooks on `cloudd` in iOS 15.7 against the
+        // `Notes` service. See tools/notes-capture/INVESTIGATION.md.
+        if let Ok(plaintext) = key.decrypt(dec, field_name.as_bytes()) {
+            return plaintext;
+        }
 
-        let key = self.keys.iter().find(|k| &k.key_id().unwrap()[..required_key.len()] == &required_key[..]).expect("required key not found!");
-        key.decrypt(dec, tag.as_bytes()).expect("Decryption failed")
+        // Fallback for records this codebase wrote with the legacy AAD
+        // format ("Zone-RecordId-FieldName"). Used by FindMy BeaconStore,
+        // iMessage cloud messages, Passwords — records that round-trip with
+        // ourselves rather than interop with Apple's clients.
+        let legacy_aad = format!("{}-{}-{}",
+            self.record_id.zone_identifier.as_ref().unwrap().value.as_ref().unwrap().name(),
+            self.record_id.value.as_ref().unwrap().name(),
+            field_name);
+        key.decrypt(dec, legacy_aad.as_bytes())
+            .expect("Decryption failed: neither Apple's nor legacy AAD format authenticated")
     }
 
     fn encrypt_data(&self, enc: &[u8], field_name: &str) -> Vec<u8> {
-        let tag = format!("{}-{}-{}", self.record_id.zone_identifier.as_ref().unwrap().value.as_ref().unwrap().name(), self.record_id.value.as_ref().unwrap().name(), field_name);
-
-        self.keys.first().expect("PCS keyset empty?").encrypt(enc, tag.as_bytes()).expect("Encryption failed")
+        // Encrypt with Apple's AAD format so records we write are
+        // interoperable with Apple's CloudKit clients on decrypt.
+        self.keys.first().expect("PCS keyset empty?")
+            .encrypt(enc, field_name.as_bytes())
+            .expect("Encryption failed")
     }
 }
 
@@ -620,8 +645,19 @@ struct PCSDigestData(Vec<u8>);
 impl PCSDigestData {
     fn verify(&self, key: &EcKey<impl HasPublic>, sig: &PCSSignature) -> Result<(), PushError> {
         let pkey = PKey::from_ec_key(key.clone())?;
-        if !sig.keyid.is_empty() && &*sig.keyid != TryInto::<CompactECKey<_>>::try_into(key.clone())?.compress() {
-            panic!("Mismatched key ID, expected {} got {}", encode_hex(&sig.keyid), encode_hex(&key.public_key_to_der()?))
+        if !sig.keyid.is_empty() {
+            match TryInto::<CompactECKey<_>>::try_into(key.clone()) {
+                Ok(compact) => {
+                    if &*sig.keyid != compact.compress() {
+                        panic!("Mismatched key ID, expected {} got {}", encode_hex(&sig.keyid), encode_hex(&key.public_key_to_der().unwrap_or_default()))
+                    }
+                }
+                Err(PushError::BadCompactECKey) => {
+                    // Key can't be represented in compact form (y > p/2).
+                    // Skip keyid comparison — signature verification below is sufficient.
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         let mut verifier = Verifier::new(MessageDigest::sha256(), &pkey)?;
