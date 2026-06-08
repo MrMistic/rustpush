@@ -15,7 +15,7 @@ use deku::{DekuContainerRead, DekuContainerWrite, DekuRead, DekuUpdate, DekuWrit
 use hkdf::hmac::Hmac;
 use keystore::KeystorePublicKey;
 use libflate::gzip::{HeaderBuilder, EncodeOptions, Encoder, Decoder};
-use log::{debug, info, warn};
+use log::{debug, info, trace, warn};
 use num_bigint::{BigInt, Sign};
 use openssl::bn::{BigNum, BigNumContext};
 use openssl::derive::Deriver;
@@ -86,7 +86,7 @@ pub struct DebugGuard<'a, T>(MutexGuard<'a, T>, Location<'a>, u16, u16);
 
 impl<'a, T> Drop for DebugGuard<'a, T> {
     fn drop(&mut self) {
-        info!("Mutex {} {}@{} dropped", self.3, self.1, self.2);
+        trace!("Mutex {} {}@{} dropped", self.3, self.1, self.2);
     }
 }
 
@@ -115,11 +115,11 @@ impl<T> DebugMutex<T> {
     pub fn lock(&self) -> impl Future<Output = DebugGuard<'_, T>> {
         let caller = Location::caller();
         let id: u16 = rand::random();
-        info!("Locking {} mutex at {caller}@{id}", self.1);
+        trace!("Locking {} mutex at {caller}@{id}", self.1);
 
         async move {
             let lock = self.0.lock().await;
-            info!("Locked {} mutex at {caller}@{id}", self.1);
+            trace!("Locked {} mutex at {caller}@{id}", self.1);
             DebugGuard(lock, *caller, id, self.1)
         }
     }
@@ -129,7 +129,7 @@ pub struct DebugReadGuard<'a, T>(RwLockReadGuard<'a, T>, Location<'a>, u16, u16)
 
 impl<'a, T> Drop for DebugReadGuard<'a, T> {
     fn drop(&mut self) {
-        info!("Read mtx {} guard {}@{} dropped", self.3, self.1, self.2);
+        trace!("Read mtx {} guard {}@{} dropped", self.3, self.1, self.2);
     }
 }
 
@@ -144,7 +144,7 @@ pub struct DebugWriteGuard<'a, T>(Option<RwLockWriteGuard<'a, T>>, Location<'a>,
 
 impl<'a, T> DebugWriteGuard<'a, T> {
     pub fn downgrade(mut self) -> DebugReadGuard<'a, T> {
-        info!("Write mtx {} guard {}@{} downgraded", self.3, self.1, self.2);
+        trace!("Write mtx {} guard {}@{} downgraded", self.3, self.1, self.2);
 
         DebugReadGuard(self.0.take().unwrap().downgrade(), self.1, self.2, self.3)
     }
@@ -152,7 +152,7 @@ impl<'a, T> DebugWriteGuard<'a, T> {
 
 impl<'a, T> Drop for DebugWriteGuard<'a, T> {
     fn drop(&mut self) {
-        info!("Write mtx {} guard {}@{} dropped", self.3, self.1, self.2);
+        trace!("Write mtx {} guard {}@{} dropped", self.3, self.1, self.2);
     }
 }
 
@@ -181,11 +181,11 @@ impl<T> DebugRwLock<T> {
     pub fn read(&self) -> impl Future<Output = DebugReadGuard<'_, T>> {
         let caller = Location::caller();
         let id: u16 = rand::random();
-        info!("Reading {} lock at {caller}@{id}", self.1);
+        trace!("Reading {} lock at {caller}@{id}", self.1);
 
         async move {
             let lock = self.0.read().await;
-            info!("Read {} locked at {caller}@{id}", self.1);
+            trace!("Read {} locked at {caller}@{id}", self.1);
             DebugReadGuard(lock, *caller, id, self.1)
         }
     }
@@ -194,11 +194,11 @@ impl<T> DebugRwLock<T> {
     pub fn write(&self) -> impl Future<Output = DebugWriteGuard<'_, T>> {
         let caller = Location::caller();
         let id: u16 = rand::random();
-        info!("Writing {} lock at {caller}@{id}", self.1);
+        trace!("Writing {} lock at {caller}@{id}", self.1);
 
         async move {
             let lock = self.0.write().await;
-            info!("Write {} locked at {caller}@{id}", self.1);
+            trace!("Write {} locked at {caller}@{id}", self.1);
             DebugWriteGuard(Some(lock), *caller, id, self.1)
         }
     }
@@ -1071,7 +1071,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
     }
 
     pub fn ensure_not_failed(&self) -> Result<(), PushError> {
-        info!("Ensuring not failed");
+        trace!("Ensuring not failed");
         match &*self.resource_state.borrow() {
             ResourceState::Failed(error) => Err(error.clone().into()),
             ResourceState::Closed => Err(PushError::ResourceClosed),

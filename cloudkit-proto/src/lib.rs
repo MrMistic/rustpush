@@ -210,7 +210,15 @@ impl CloudKitEncryptedValue for String {
     }
 
     fn from_value_encrypted(value: &record::field::Value, encryptor: &impl CloudKitEncryptor, field_name: &str) -> Option<Self> {
-        Some(record::field::EncryptedValue::decode(&encryptor.decrypt_data(value.bytes_value.as_ref().unwrap(), field_name)[..]).unwrap().string_value().to_string())
+        let decrypted = encryptor.decrypt_data(value.bytes_value.as_ref().unwrap(), field_name);
+        // Try protobuf EncryptedValue wrapper first (iMessage cloud messages format)
+        if let Ok(ev) = record::field::EncryptedValue::decode(&decrypted[..]) {
+            if ev.string_value.is_some() {
+                return Some(ev.string_value().to_string());
+            }
+        }
+        // Fall back to raw UTF-8 bytes (Apple Notes format)
+        Some(String::from_utf8_lossy(&decrypted).to_string())
     }
 }
 

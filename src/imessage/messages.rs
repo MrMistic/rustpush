@@ -218,7 +218,10 @@ impl MessageParts {
                 MessagePart::Attachment(attachment) => {
                     my_part_idx += 1;
                     let filesize = attachment.get_size().to_string();
-                    let is_sticker = matches!(&part.ext, Some(PartExtension::Sticker { .. }));
+                    let is_sticker = matches!(
+                        &part.ext,
+                        Some(PartExtension::Sticker { .. }) | Some(PartExtension::StandaloneSticker { .. })
+                    );
                     let mut element = XmlEvent::start_element("FILE")
                         .attr("name", &attachment.name)
                         .attr("width", "0")
@@ -917,11 +920,41 @@ pub enum PartExtension {
         effect_type: i64,
         #[serde(rename = "sid")]
         sticker_id: String,
-    }
+    },
+    /// Standalone sticker send (a sticker sent as a new message, not placed on
+    /// an existing message). Carries the minimal sticker user-info that the
+    /// recipient's BlastDoor uses to classify the attachment as a sticker
+    /// (sid/shash/stickerEffectType + pid), but NONE of the positioning
+    /// attributes (spw/sro/ssa/sxs/sys/sli/spv/sai/safi) — those are
+    /// REACTION-only. Also drives `message-part` omission on the FILE element.
+    ///
+    /// Captured from a real iPad standalone sticker (2026-07-03): a plain
+    /// (non-associated, no amt/amk) message whose FILE carries
+    /// pid/sid/shash/stickerEffectType only.
+    StandaloneSticker {
+        #[serde(rename = "sid")]
+        sticker_id: String,
+        #[serde(rename = "shash")]
+        hash: String,
+        #[serde(rename = "stickerEffectType")]
+        effect_type: i64,
+    },
 }
 
 impl PartExtension {
     fn to_dict(&self) -> HashMap<String, String> {
+        // StandaloneSticker emits only the minimal sticker user-info the
+        // recipient uses to classify the attachment as a sticker: sid, shash,
+        // stickerEffectType, and pid (the Stickers.UserGenerated bundle id).
+        // NO positioning attributes (those are reaction-only).
+        if let PartExtension::StandaloneSticker { sticker_id, hash, effect_type } = self {
+            let mut result: HashMap<String, String> = HashMap::new();
+            result.insert("sid".to_string(), sticker_id.clone());
+            result.insert("shash".to_string(), hash.clone());
+            result.insert("stickerEffectType".to_string(), effect_type.to_string());
+            result.insert("pid".to_string(), STICKERS_EXT_BID.to_string());
+            return result;
+        }
         let mut result: HashMap<String, String> = plist::to_value(self).unwrap().into_dictionary().unwrap().into_iter()
             .map(|(i, value)| {
                 (i, match value {
@@ -946,6 +979,9 @@ impl PartExtension {
                     result.insert("shash".to_string(), clean_hash.to_string());
                     result.insert("suri".to_string(), format!("sticker:///emoji/identifier/{}", emoji));
                 }
+            }
+            PartExtension::StandaloneSticker { .. } => {
+                // Unreachable due to early return above; included for exhaustiveness.
             }
         }
         result
@@ -2301,6 +2337,17 @@ impl MessageInst {
                             balloon_part = balloon;
                             balloon_id = Some(app_obj.bundle_id.clone());
                         }
+                        // Standalone stickers carry `ati` (app_info) but OMIT
+                        // `bid` (balloon_id). Real iPad standalone sticker
+                        // captures (2026-07-03) show `ati` present with NO `bid`
+                        // key. Emitting `bid` routes the message through the
+                        // balloon/interactive path on the recipient. Clear it
+                        // while keeping app_info.
+                        let is_standalone_sticker = normal.parts.0.iter()
+                            .any(|p| matches!(p.ext, Some(PartExtension::StandaloneSticker { .. })));
+                        if is_standalone_sticker {
+                            balloon_id = None;
+                        }
                         if let Some(link_meta) = &normal.link_meta {
                             balloon_id = Some("com.apple.messages.URLBalloonProvider".to_string());
                             balloon_part = Some(gzip(&BaseBalloonBody {
@@ -2347,6 +2394,12 @@ impl MessageInst {
                             low_res_wallpaper_tag: normal.embedded_profile.as_ref().and_then(|p| p.poster.as_ref().map(|p| p.low_res_wallpaper_tag.clone().into())),
                             wallpaper_update_key: normal.embedded_profile.as_ref().and_then(|p| if p.poster.is_some() { Some("YES".to_string()) } else { None }),
                             update_info_included: normal.embedded_profile.as_ref().and_then(|p| if p.poster.is_some() { Some(15) } else { None }),
+                            // Standalone stickers need arc/are OMITTED from the
+                            // envelope. iPad sticker payloads (2026-04-13 captures)
+                            // omit these keys entirely — only real MSMessages balloon
+                            // extensions send them as empty strings.
+                            arc: None,
+                            are: None,
                         };
         
                         if normal.parts.is_multipart() {
@@ -2982,5 +3035,421 @@ impl MessageInst {
 impl fmt::Display for MessageInst {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "[{}] '{}'", self.sender.clone().unwrap_or("unknown".to_string()), self.message)
+    }
+}
+
+#[cfg(test)]
+mod property3_tests {
+    use super::*;
+    use rand::Rng;
+
+    /// Helper: generate a random alphanumeric string of given length.
+    fn random_string(rng: &mut impl Rng, max_len: usize) -> String {
+        let len = rng.gen_range(1..=max_len);
+        (0..len)
+            .map(|_| {
+                let idx = rng.gen_range(0..36);
+                if idx < 10 {
+                    (b'0' + idx) as char
+                } else {
+                    (b'a' + idx - 10) as char
+                }
+            })
+            .collect()
+    }
+
+    /// Helper: generate a random MIME type string.
+    fn random_mime(rng: &mut impl Rng) -> String {
+        let types = ["image/png", "image/jpeg", "application/octet-stream", "video/mp4", "audio/mpeg"];
+        types[rng.gen_range(0..types.len())].to_string()
+    }
+
+    /// Helper: generate a random UTI type string.
+    fn random_uti(rng: &mut impl Rng) -> String {
+        let utis = ["public.png", "public.jpeg", "public.data", "public.mpeg-4", "public.mp3"];
+        utis[rng.gen_range(0..utis.len())].to_string()
+    }
+
+    /// Helper: create an IndexedMessagePart with StandaloneSticker ext and random attachment data.
+    fn make_standalone_sticker_part(rng: &mut impl Rng) -> IndexedMessagePart {
+        let data_size = rng.gen_range(1..1024);
+        let data: Vec<u8> = (0..data_size).map(|_| rng.gen()).collect();
+        IndexedMessagePart {
+            part: MessagePart::Attachment(Attachment {
+                a_type: AttachmentType::Inline(data),
+                part: 0,
+                uti_type: random_uti(rng),
+                mime: random_mime(rng),
+                name: format!("{}.png", random_string(rng, 20)),
+                iris: false,
+            }),
+            idx: None,
+            ext: Some(PartExtension::StandaloneSticker {
+                sticker_id: format!("{}-sticker.png", random_string(rng, 16)),
+                hash: random_string(rng, 16),
+                effect_type: 0,
+            }),
+        }
+    }
+
+    /// **Validates: standalone sticker wire format (corrected 2026-07-03)**
+    ///
+    /// Property 3: Standalone sticker wire format carries the minimal sticker
+    /// user-info (sid/shash/stickerEffectType/pid) but EXCLUDES positioning
+    /// attributes and the message-part attribute.
+    ///
+    /// Derived from a real iPad standalone sticker capture: a plain
+    /// (non-associated) message whose FILE element carries exactly
+    /// pid/sid/shash/stickerEffectType and none of the positioning attrs.
+    #[test]
+    fn property3_standalone_sticker_excludes_positioning_but_carries_userinfo() {
+        let mut rng = rand::thread_rng();
+
+        // Positioning attributes that MUST NOT appear on a standalone sticker
+        // (these are reaction-only).
+        let forbidden_attrs = [
+            "spw", "sro", "sai", "ssa", "sli", "sxs", "sys", "spv",
+            "safi", "suri",
+        ];
+        // Sticker user-info attributes that MUST appear on a standalone sticker.
+        let required_attrs = ["sid", "shash", "stickerEffectType", "pid"];
+
+        for iteration in 0..100 {
+            let part = make_standalone_sticker_part(&mut rng);
+            let parts = MessageParts(vec![part]);
+
+            let xml = parts.to_xml(None);
+
+            // Positioning attributes must be absent.
+            for attr in &forbidden_attrs {
+                let attr_pattern = format!("{}=\"", attr);
+                assert!(
+                    !xml.contains(&attr_pattern),
+                    "Iteration {}: standalone sticker XML must NOT contain positioning attribute '{}', but found it in: {}",
+                    iteration, attr, xml
+                );
+            }
+
+            // Required sticker user-info attributes must be present.
+            for attr in &required_attrs {
+                let attr_pattern = format!("{}=\"", attr);
+                assert!(
+                    xml.contains(&attr_pattern),
+                    "Iteration {}: standalone sticker XML MUST contain user-info attribute '{}', but it was missing from: {}",
+                    iteration, attr, xml
+                );
+            }
+
+            // `message-part` must be omitted on the FILE element.
+            assert!(
+                !xml.contains("message-part=\""),
+                "Iteration {}: standalone sticker XML must NOT contain 'message-part' attribute, but found it in: {}",
+                iteration, xml
+            );
+
+            // `pid` must be exactly the Stickers.UserGenerated bundle id.
+            assert!(
+                xml.contains(&format!("pid=\"{}\"", STICKERS_EXT_BID)),
+                "Iteration {}: standalone sticker pid must be STICKERS_EXT_BID, xml: {}",
+                iteration, xml
+            );
+        }
+    }
+
+    /// Sub-property: StandaloneSticker.to_dict emits exactly the 4 user-info
+    /// keys (sid, shash, stickerEffectType, pid) and nothing else.
+    #[test]
+    fn property3_standalone_sticker_to_dict_has_userinfo_only() {
+        let ext = PartExtension::StandaloneSticker {
+            sticker_id: "abc123-sticker.png".to_string(),
+            hash: "0c5e1af7f0182c53".to_string(),
+            effect_type: 0,
+        };
+        let dict = ext.to_dict();
+
+        let mut keys: Vec<&String> = dict.keys().collect();
+        keys.sort();
+        let mut expected = vec![
+            "pid".to_string(),
+            "shash".to_string(),
+            "sid".to_string(),
+            "stickerEffectType".to_string(),
+        ];
+        expected.sort();
+        let expected_refs: Vec<&String> = expected.iter().collect();
+        assert_eq!(
+            keys, expected_refs,
+            "StandaloneSticker.to_dict() must contain exactly the user-info keys, got: {:?}",
+            dict
+        );
+
+        assert_eq!(dict.get("sid").map(|s| s.as_str()), Some("abc123-sticker.png"));
+        assert_eq!(dict.get("shash").map(|s| s.as_str()), Some("0c5e1af7f0182c53"));
+        assert_eq!(dict.get("stickerEffectType").map(|s| s.as_str()), Some("0"));
+        assert_eq!(dict.get("pid").map(|s| s.as_str()), Some(STICKERS_EXT_BID));
+    }
+
+    /// Additional sub-property: FILE element is still present and well-formed
+    #[test]
+    fn property3_standalone_sticker_file_element_present() {
+        let mut rng = rand::thread_rng();
+
+        for _ in 0..50 {
+            let part = make_standalone_sticker_part(&mut rng);
+            let expected_name = if let MessagePart::Attachment(ref a) = part.part {
+                a.name.clone()
+            } else {
+                panic!("Expected attachment");
+            };
+
+            let parts = MessageParts(vec![part]);
+            let xml = parts.to_xml(None);
+
+            // The FILE element should still be present with the attachment name
+            assert!(
+                xml.contains("FILE"),
+                "StandaloneSticker XML must contain a FILE element"
+            );
+            assert!(
+                xml.contains(&format!("name=\"{}\"", expected_name)),
+                "StandaloneSticker XML FILE element must contain the attachment name"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod property5_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// **Validates: Requirements 3.6**
+    ///
+    /// Property 5: Non-sticker messages retain message-part attribute.
+    /// For any attachment message serialized with `ext: None` (a regular
+    /// attachment, not a sticker), the resulting XML SHALL include the
+    /// `message-part` attribute on the FILE element.
+    mod property5_non_sticker_message_part_retention {
+        use super::*;
+
+        /// Strategy to generate arbitrary file names (alphanumeric + extension)
+        fn arb_file_name() -> impl Strategy<Value = String> {
+            ("[a-zA-Z0-9_]{1,20}\\.[a-z]{2,4}").prop_map(|s| s)
+        }
+
+        /// Strategy to generate arbitrary MIME types
+        fn arb_mime_type() -> impl Strategy<Value = String> {
+            prop_oneof![
+                Just("image/png".to_string()),
+                Just("image/jpeg".to_string()),
+                Just("application/pdf".to_string()),
+                Just("video/mp4".to_string()),
+                Just("audio/mpeg".to_string()),
+                Just("application/octet-stream".to_string()),
+                Just("text/plain".to_string()),
+                Just("image/gif".to_string()),
+            ]
+        }
+
+        /// Strategy to generate arbitrary UTI types
+        fn arb_uti_type() -> impl Strategy<Value = String> {
+            prop_oneof![
+                Just("public.png".to_string()),
+                Just("public.jpeg".to_string()),
+                Just("com.adobe.pdf".to_string()),
+                Just("public.mpeg-4".to_string()),
+                Just("public.mp3".to_string()),
+                Just("public.data".to_string()),
+                Just("public.plain-text".to_string()),
+                Just("com.compuserve.gif".to_string()),
+            ]
+        }
+
+        /// Strategy to generate arbitrary inline data sizes (1 byte to 10KB)
+        fn arb_inline_data() -> impl Strategy<Value = Vec<u8>> {
+            prop::collection::vec(any::<u8>(), 1..1024)
+        }
+
+        /// Strategy to generate a valid part index
+        fn arb_part_idx() -> impl Strategy<Value = Option<usize>> {
+            prop_oneof![
+                Just(None),
+                (0usize..10).prop_map(Some),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(100))]
+
+            #[test]
+            fn non_sticker_attachment_has_message_part_attr(
+                file_name in arb_file_name(),
+                mime in arb_mime_type(),
+                uti in arb_uti_type(),
+                data in arb_inline_data(),
+                part_idx in arb_part_idx(),
+            ) {
+                // Create an IndexedMessagePart with ext: None (regular attachment)
+                let parts = MessageParts(vec![IndexedMessagePart {
+                    part: MessagePart::Attachment(Attachment {
+                        a_type: AttachmentType::Inline(data),
+                        part: 0,
+                        uti_type: uti,
+                        mime,
+                        name: file_name,
+                        iris: false,
+                    }),
+                    idx: part_idx,
+                    ext: None, // Non-sticker: ext is None
+                }]);
+
+                // Serialize to XML
+                let xml = parts.to_xml(None);
+
+                // Verify the FILE element contains the message-part attribute
+                prop_assert!(
+                    xml.contains("message-part="),
+                    "Non-sticker attachment XML must contain 'message-part' attribute, got: {}",
+                    xml
+                );
+            }
+
+            #[test]
+            fn non_sticker_multi_attachment_all_have_message_part(
+                file_name1 in arb_file_name(),
+                file_name2 in arb_file_name(),
+                mime1 in arb_mime_type(),
+                mime2 in arb_mime_type(),
+                uti1 in arb_uti_type(),
+                uti2 in arb_uti_type(),
+                data1 in arb_inline_data(),
+                data2 in arb_inline_data(),
+            ) {
+                // Create multiple non-sticker attachments
+                let parts = MessageParts(vec![
+                    IndexedMessagePart {
+                        part: MessagePart::Attachment(Attachment {
+                            a_type: AttachmentType::Inline(data1),
+                            part: 0,
+                            uti_type: uti1,
+                            mime: mime1,
+                            name: file_name1,
+                            iris: false,
+                        }),
+                        idx: Some(0),
+                        ext: None,
+                    },
+                    IndexedMessagePart {
+                        part: MessagePart::Attachment(Attachment {
+                            a_type: AttachmentType::Inline(data2),
+                            part: 1,
+                            uti_type: uti2,
+                            mime: mime2,
+                            name: file_name2,
+                            iris: false,
+                        }),
+                        idx: Some(1),
+                        ext: None,
+                    },
+                ]);
+
+                let xml = parts.to_xml(None);
+
+                // Count FILE elements and message-part attributes
+                let file_count = xml.matches("<FILE ").count();
+                let message_part_count = xml.matches("message-part=").count();
+
+                // Each FILE element should have a message-part attribute
+                prop_assert_eq!(
+                    file_count, message_part_count,
+                    "Each non-sticker FILE element must have a message-part attribute. \
+                     FILE elements: {}, message-part attrs: {}. XML: {}",
+                    file_count, message_part_count, xml
+                );
+            }
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod property4_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// **Validates: Requirements 6.2**
+    ///
+    /// Property 4: Sticker-reaction wire format preserves positioning attributes.
+    /// For any message serialized with `PartExtension::Sticker` (the reaction variant
+    /// with all positioning fields populated), the resulting XML SHALL contain all
+    /// sticker positioning attributes on the FILE element.
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        /// Property 4: Sticker-reaction wire format preserves positioning attributes.
+        ///
+        /// **Validates: Requirements 6.2**
+        #[test]
+        fn sticker_reaction_xml_contains_all_positioning_attributes(
+            msg_width in 1.0f64..1000.0f64,
+            rotation in -std::f64::consts::PI..std::f64::consts::PI,
+            sai in 0u64..1000u64,
+            scale in 0.1f64..5.0f64,
+            update in proptest::option::of(any::<bool>()),
+            sli in 0u64..1000u64,
+            normalized_x in 0.0f64..1.0f64,
+            normalized_y in 0.0f64..1.0f64,
+            version in 1u64..10u64,
+            safi in 0u64..100u64,
+            effect_type in 0i64..10i64,
+            hash in "[a-zA-Z0-9]{8,32}",
+            sticker_id in "[a-zA-Z0-9]{4,16}",
+        ) {
+            let ext = PartExtension::Sticker {
+                msg_width,
+                rotation,
+                sai,
+                scale,
+                update,
+                sli,
+                normalized_x,
+                normalized_y,
+                version,
+                hash,
+                safi,
+                effect_type,
+                sticker_id,
+            };
+
+            let parts = MessageParts(vec![IndexedMessagePart {
+                part: MessagePart::Attachment(Attachment {
+                    a_type: AttachmentType::Inline(vec![0u8; 10]),
+                    part: 0,
+                    uti_type: "public.png".to_string(),
+                    mime: "image/png".to_string(),
+                    name: "sticker.png".to_string(),
+                    iris: false,
+                }),
+                idx: Some(0),
+                ext: Some(ext),
+            }]);
+            let xml = parts.to_xml(None);
+
+            // All sticker positioning attributes that MUST be present
+            prop_assert!(xml.contains("spw="), "XML missing spw attribute: {}", xml);
+            prop_assert!(xml.contains("sro="), "XML missing sro attribute: {}", xml);
+            prop_assert!(xml.contains("sai="), "XML missing sai attribute: {}", xml);
+            prop_assert!(xml.contains("ssa="), "XML missing ssa attribute: {}", xml);
+            prop_assert!(xml.contains("sli="), "XML missing sli attribute: {}", xml);
+            prop_assert!(xml.contains("sxs="), "XML missing sxs attribute: {}", xml);
+            prop_assert!(xml.contains("sys="), "XML missing sys attribute: {}", xml);
+            prop_assert!(xml.contains("spv="), "XML missing spv attribute: {}", xml);
+            prop_assert!(xml.contains("safi="), "XML missing safi attribute: {}", xml);
+            prop_assert!(xml.contains("stickerEffectType="), "XML missing stickerEffectType attribute: {}", xml);
+            prop_assert!(xml.contains("sid="), "XML missing sid attribute: {}", xml);
+            prop_assert!(xml.contains("shash="), "XML missing shash attribute: {}", xml);
+            prop_assert!(xml.contains("pid="), "XML missing pid attribute: {}", xml);
+        }
     }
 }

@@ -1,11 +1,11 @@
-use std::{collections::HashMap, io::Cursor, marker::PhantomData, str::FromStr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{collections::HashMap, io::Cursor, marker::PhantomData, str::FromStr, sync::{Arc, atomic::{AtomicI64, Ordering}}, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use aes::{cipher::consts::U16, Aes128};
 use cloudkit_proto::{octagon_pairing_message::{self, Step5}, CuttlefishPeer, OctagonPairingMessage, OctagonWrapper, SignedInfo};
 use deku::{DekuRead, DekuWrite};
 use hkdf::Hkdf;
 use icloud_auth::{AppleAccount, CircleSendMessage, GenerateVerificationTokenRequest, LoginState};
-use keystore::{KeystoreAccessRules, KeystoreDigest, KeystorePadding, KeystorePublicKey, KeystoreSignKey, RsaKey};
+use keystore::{AesKeystoreKey, EncryptMode, KeystoreAccessRules, KeystoreDigest, KeystoreEncryptKey, KeystorePadding, KeystorePublicKey, KeystoreSignKey, RsaKey};
 use log::{debug, info, warn};
 use omnisette::{AnisetteClient, AnisetteProvider};
 use openssl::{ec::EcKey, hash::MessageDigest, nid::Nid, pkey::{PKey, Private}, rsa::{Padding, Rsa}, sha::sha1, sign::Signer, x509::{X509Name, X509Req}};
@@ -55,10 +55,55 @@ impl LoginDelegate {
     }
 }
 
+/// Hard expiry for the cached MobileMe delegate. Past this we refuse to hand out the
+/// token and a refresh becomes mandatory — errors propagate to the caller.
+const MME_HARD_EXPIRY: Duration = Duration::from_secs(60 * 60 * 24 * 7);
+
+/// Soft threshold. Once the delegate is older than this we start *proactively* refreshing
+/// while the current token is still perfectly valid.
+///
+/// Why: persisting the delegate (see `set_cache_path`) removed the old "relay needed on
+/// every cold start" behaviour, but it made the 7-day expiry actually reachable. Without a
+/// soft window, crossing it turns the very next token request into a mandatory,
+/// synchronous, relay-dependent delegate login at an arbitrary moment — and if the relay
+/// happens to be offline right then, Find My hard-fails. Refreshing from day 5 gives a
+/// ~2-day runway to keep retrying before expiry matters.
+const MME_SOFT_REFRESH: Duration = Duration::from_secs(60 * 60 * 24 * 5);
+
+/// Minimum gap between proactive (soft-window) refresh attempts, in ms.
+///
+/// This gate is load-bearing, not a nicety: `get_mme_token` is called from the FMF fetch
+/// loop roughly every 5 seconds. Without it, entering the soft window with an unreachable
+/// relay would attempt a full GSA + MobileMe delegate login every 5s for two days — the
+/// exact per-cycle churn that was removed from `fetch_locations`.
+const MME_PROACTIVE_RETRY_INTERVAL_MS: i64 = 60 * 60 * 1000;
+
+/// Last proactive refresh attempt (Unix ms). 0 = never.
+static MME_LAST_PROACTIVE_MS: AtomicI64 = AtomicI64::new(0);
+
+/// True if enough time has passed since the last proactive attempt to try again. On `true`,
+/// atomically claims the slot so concurrent callers don't both fire. Mirrors the
+/// `fmf_auto_publish_should_fire` pattern in findmy.rs.
+fn mme_proactive_should_fire() -> bool {
+    let now_ms = duration_since_epoch().as_millis() as i64;
+    let last = MME_LAST_PROACTIVE_MS.load(Ordering::Relaxed);
+    if last != 0 && now_ms.saturating_sub(last) < MME_PROACTIVE_RETRY_INTERVAL_MS {
+        return false;
+    }
+    MME_LAST_PROACTIVE_MS
+        .compare_exchange(last, now_ms, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
+}
+
 pub struct TokenProvider<T: AnisetteProvider> {
     account: Arc<DebugMutex<AppleAccount<T>>>,
-    mme_delegate: DebugMutex<Option<MobileMeDelegateResponse>>,
+    pub mme_delegate: DebugMutex<Option<MobileMeDelegateResponse>>,
     mme_refreshed: DebugMutex<SystemTime>,
+    /// Absolute path to the encrypted MME delegate cache (`mme_delegate.plist`).
+    /// `None` until `set_cache_path` is called by the host after construction —
+    /// when unset, persistence is simply skipped and behavior matches the old
+    /// in-memory-only path.
+    mme_cache_path: DebugMutex<Option<std::path::PathBuf>>,
     os_config: Arc<dyn OSConfig>,
 }
 
@@ -111,7 +156,100 @@ impl<T: AnisetteProvider> TokenProvider<T> {
             os_config,
             mme_delegate: DebugMutex::new(None),
             mme_refreshed: DebugMutex::new(SystemTime::UNIX_EPOCH),
+            mme_cache_path: DebugMutex::new(None),
         })
+    }
+
+    /// Keystore key alias used to encrypt the MME delegate cache at rest. Mirrors the
+    /// `gsa:password` pattern already used to store the account password.
+    const MME_CACHE_KEY_ALIAS: &'static str = "mme:delegate";
+
+    fn mme_cache_key() -> Result<AesKeystoreKey, PushError> {
+        Ok(AesKeystoreKey::ensure(Self::MME_CACHE_KEY_ALIAS, 256, KeystoreAccessRules {
+            block_modes: vec![EncryptMode::Gcm],
+            can_encrypt: true,
+            can_decrypt: true,
+            ..Default::default()
+        })?)
+    }
+
+    /// Point this provider at a directory where the encrypted MME delegate cache
+    /// should live, and eagerly load any existing cache into memory. Called by the
+    /// host once after construction (it knows the state dir; the provider doesn't).
+    ///
+    /// Loading here — rather than lazily inside `get_mme_token` — means the very
+    /// first token request after a cold start already sees the cached delegate and
+    /// skips the relay round-trip, which is the whole point.
+    pub async fn set_cache_path(&self, dir: std::path::PathBuf) {
+        let path = dir.join("mme_delegate.plist");
+        *self.mme_cache_path.lock().await = Some(path.clone());
+
+        // If we already hold a delegate in memory (e.g. path set after a login this
+        // session), don't clobber it with disk.
+        if self.mme_delegate.lock().await.is_some() {
+            return;
+        }
+
+        match Self::load_mme_cache(&path) {
+            Ok(Some((delegate, refreshed))) => {
+                *self.mme_delegate.lock().await = Some(delegate);
+                *self.mme_refreshed.lock().await = refreshed;
+                info!("[MME-CACHE] Loaded persisted MME delegate (refreshed {:?} ago)",
+                    SystemTime::now().duration_since(refreshed).ok());
+            }
+            Ok(None) => info!("[MME-CACHE] No persisted MME delegate on disk"),
+            Err(e) => warn!("[MME-CACHE] Failed to load persisted MME delegate (ignoring): {:?}", e),
+        }
+    }
+
+    /// Decrypt + parse the on-disk delegate cache. Returns Ok(None) when the file
+    /// doesn't exist. Any corruption is surfaced as Err so the caller can log and
+    /// fall through to a normal (relay-backed) refresh rather than crashing.
+    fn load_mme_cache(path: &std::path::Path) -> Result<Option<(MobileMeDelegateResponse, SystemTime)>, PushError> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let ciphertext: Data = plist::from_file(path)?;
+        let key = Self::mme_cache_key()?;
+        let plaintext = key.decrypt(ciphertext.as_ref(), &EncryptMode::Gcm)?;
+        let cache: MmeDelegateCache = plist::from_bytes(&plaintext)?;
+
+        // Convert stored epoch-millis back to a SystemTime. Guard against a
+        // negative/absurd value by clamping to UNIX_EPOCH, which just forces a
+        // refresh rather than panicking.
+        let refreshed = if cache.refreshed_ms <= 0 {
+            UNIX_EPOCH
+        } else {
+            UNIX_EPOCH + Duration::from_millis(cache.refreshed_ms as u64)
+        };
+        Ok(Some((cache.delegate, refreshed)))
+    }
+
+    /// Encrypt + write the current delegate to disk. Best-effort: a persistence
+    /// failure is logged but never propagated, since the in-memory delegate is
+    /// still perfectly usable for this session.
+    async fn save_mme_cache(&self, delegate: &MobileMeDelegateResponse, refreshed: SystemTime) {
+        let Some(path) = self.mme_cache_path.lock().await.clone() else {
+            return; // host never set a path; persistence disabled
+        };
+
+        let refreshed_ms = refreshed.duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let cache = MmeDelegateCache { delegate: delegate.clone(), refreshed_ms };
+
+        let result: Result<(), PushError> = (|| {
+            let plaintext = crate::util::plist_to_buf(&cache)?;
+            let key = Self::mme_cache_key()?;
+            let ciphertext: Data = key.encrypt(&plaintext, &mut EncryptMode::Gcm)?.into();
+            plist::to_file_xml(&path, &ciphertext)?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => info!("[MME-CACHE] Persisted MME delegate"),
+            Err(e) => warn!("[MME-CACHE] Failed to persist MME delegate (continuing): {:?}", e),
+        }
     }
 
     pub async fn get_storage_info(&self) -> Result<QuotaData, PushError> {
@@ -163,18 +301,68 @@ impl<T: AnisetteProvider> TokenProvider<T> {
         self.get_gsa_token("com.apple.gs.idms.pet").await.ok_or(PushError::TokenMissing)?;
         let delegates = login_apple_delegates(&mut *self.account.lock().await, None, &*self.os_config, &[LoginDelegate::MobileMe]).await?;
 
+        let now = SystemTime::now();
         *mme = delegates.mobileme;
-        *self.mme_refreshed.lock().await = SystemTime::now();
+        *self.mme_refreshed.lock().await = now;
+
+        // Persist the fresh delegate so the next cold start can reuse it without
+        // the relay. Best-effort; drops the mme lock first so save can't deadlock
+        // against anything that also takes it.
+        let to_save = mme.clone();
+        drop(mme);
+        if let Some(delegate) = to_save {
+            self.save_mme_cache(&delegate, now).await;
+        }
 
         Ok(())
     }
 
     pub async fn get_mme_token(&self, token: &str) -> Result<String, PushError> {
-        // refresh every week
-        if self.mme_delegate.lock().await.is_none() || SystemTime::now().duration_since(*self.mme_refreshed.lock().await).unwrap() 
-            > Duration::from_secs(60 * 60 * 24 * 7) {
-            self.refresh_mme().await?;
+        // Tiered refresh by delegate age:
+        //   missing, unknown age, or past HARD  -> Mandatory: refresh, propagate failure
+        //   past SOFT but within HARD           -> Proactive: try, tolerate failure
+        //   younger than SOFT                   -> Skip: use as-is
+        //
+        // duration_since() errors when the stored timestamp is in the FUTURE (clock moved
+        // backwards, or a bad persisted value). This used to be `.unwrap()`, which was fine
+        // for an in-memory SystemTime::now() but is a real panic risk now that the timestamp
+        // is restored from disk. "Can't compute age" is treated as Mandatory, which is safe.
+        enum RefreshAction { Mandatory, Proactive, Skip }
+
+        // Scoped so both locks are released before any refresh_mme() call — it takes the
+        // delegate lock itself and would otherwise deadlock.
+        let action = {
+            let delegate = self.mme_delegate.lock().await;
+            if delegate.is_none() {
+                RefreshAction::Mandatory
+            } else {
+                let refreshed = *self.mme_refreshed.lock().await;
+                match SystemTime::now().duration_since(refreshed) {
+                    Ok(age) if age > MME_HARD_EXPIRY => RefreshAction::Mandatory,
+                    Ok(age) if age > MME_SOFT_REFRESH => RefreshAction::Proactive,
+                    Ok(_) => RefreshAction::Skip,
+                    Err(_) => RefreshAction::Mandatory,
+                }
+            }
+        };
+
+        match action {
+            RefreshAction::Mandatory => self.refresh_mme().await?,
+            RefreshAction::Proactive => {
+                if mme_proactive_should_fire() {
+                    match self.refresh_mme().await {
+                        Ok(()) => info!("[MME-CACHE] Proactive refresh succeeded (delegate was past the {}-day soft threshold)",
+                            MME_SOFT_REFRESH.as_secs() / 86400),
+                        // Deliberately swallowed: the existing token is still inside the hard
+                        // expiry window, so this is a warning with runway left, not a failure.
+                        Err(e) => warn!("[MME-CACHE] Proactive refresh failed; continuing on the existing \
+                            still-valid token and will retry later: {:?}", e),
+                    }
+                }
+            }
+            RefreshAction::Skip => {}
         }
+
         self.mme_delegate.lock().await.as_ref().expect("no MME?").tokens.get(token).ok_or(PushError::TokenMissing).cloned()
     }
 }
@@ -186,11 +374,27 @@ pub struct IDSDelegateResponse {
     pub profile_id: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize, Clone)]
 pub struct MobileMeDelegateResponse {
     pub tokens: HashMap<String, String>,
     #[serde(rename = "com.apple.mobileme")]
     pub config: Dictionary,
+}
+
+/// On-disk form of the cached MobileMe delegate. The delegate's `searchPartyToken`
+/// (and the other MME tokens) are valid for ~1 week, but `TokenProvider` previously
+/// held them in memory only, so every app restart forced a fresh relay-backed
+/// delegate login (generate_validation_data -> the paired device). Persisting the
+/// delegate lets a cold start reuse a still-valid token, so Find My works even when
+/// the relay is momentarily offline.
+///
+/// `refreshed_ms` is stored as Unix-epoch milliseconds rather than a serialized
+/// SystemTime: it's encoding-agnostic and lets us reason about staleness/skew
+/// explicitly instead of trusting a possibly-future timestamp.
+#[derive(Deserialize, Serialize, Clone)]
+struct MmeDelegateCache {
+    delegate: MobileMeDelegateResponse,
+    refreshed_ms: i64,
 }
 
 pub struct DelegateResponses {
